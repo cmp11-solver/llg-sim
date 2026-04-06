@@ -1,0 +1,95 @@
+// mumax/st_problems/sp2.mx3
+//
+// Standard Problem #2 (MuMax3 reference style)
+// Minimal OVF saving:
+//   - remanent state (after relax at B_ext=0)
+//   - coercivity state (first state at which msum <= 0)
+//
+// PLUS optional event OVFs during coercivity scan:
+//   - m_dXX_scan_YYYY.ovf saved after each relax() call in the scan
+//
+// Notes:
+// - Uses MuMax-native relax() workflow (not mirroring Rust relax internals).
+// - Uses the original MuMax SP2 grid rule (the version that already ran).
+// - Switching criterion: msum = <mx> + <my> + <mz>.
+
+Msat = 1000e3
+Aex  = 10e-12
+
+// exchange length
+lex := sqrt(Aex.GetRegion(0) / (0.5 * mu0 * pow(Msat.GetRegion(0), 2)))
+
+// component handles
+mx := m.comp(0)
+my := m.comp(1)
+mz := m.comp(2)
+
+sqrt3 := sqrt(3)
+
+// Toggle: save OVF after *every* coercivity relax() step.
+// Set to 0 to only save rem + hc.
+saveEventOVF := 1
+
+// scan magnet size d
+for d := 30; d >= 1; d-- {
+
+    Sizex := 5 * lex * d
+    Sizey := 1 * lex * d
+    Sizez := 0.1 * lex * d
+    alpha = 0.5
+    SetPBC(0, 0, 0)
+
+    // --- Original MuMax SP2 grid rule (this is what you ran before) ---
+    // (Note: despite the comment often seen online, this does NOT enforce dx<=0.5*lex;
+    // it’s the standard “FFT-friendly” discretisation used in many MuMax SP2 scripts.)
+    nx := pow(2, ilogb(Sizex/(5*0.5*lex))) * 5
+    ny := nx / 5
+    SetGridSize(nx, ny, 1)
+    SetCellSize(Sizex/nx, Sizey/ny, Sizez)
+
+    // --- Remanence ---
+    B_ext = vector(0, 0, 0)
+    m = uniform(1, 0.3, 0)
+    relax()
+    remanence := m.average()
+
+    // OVF: remanent relaxed state (one per d)
+    SaveAs(m, sprintf("m_d%02d_rem", d))
+
+    // --- Coercivity scan ---
+    Ms := Msat.GetRegion(0)
+
+    // Start/step exactly as in your original script
+    bc := 0.0445 * Ms
+    bc_step := 0.00005 * Ms
+
+    // Use a while-style loop (MuMax does not allow `break`)
+    step := 0
+    msum := mx.average() + my.average() + mz.average()
+
+    for msum > 0 {
+
+        B_ext = vector(-bc*mu0/sqrt3, -bc*mu0/sqrt3, -bc*mu0/sqrt3)
+        relax()
+
+        if saveEventOVF > 0 {
+            SaveAs(m, sprintf("m_d%02d_scan_%04d", d, step))
+        }
+        step = step + 1
+
+        // Update criterion after relaxation
+        msum = mx.average() + my.average() + mz.average()
+
+        // Only advance bc if still on the positive side
+        if msum > 0 {
+            bc = bc + bc_step
+        }
+    }
+
+    // OVF: coercivity (first state where msum <= 0)
+    SaveAs(m, sprintf("m_d%02d_hc", d))
+
+    // Reset and write table row
+    B_ext = vector(0, 0, 0)
+    fprintln("table.txt", d, remanence.x(), remanence.y(), bc/Ms)
+}

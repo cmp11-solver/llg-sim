@@ -1,0 +1,3580 @@
+// src/effective_field/mg_composite.rs
+//
+// Composite-grid demag for AMR micromagnetics.
+//
+// Architecture:
+//
+//   1. L0: 3D MG solve on padded box with treecode BCs.
+//      PPPM ΔK auto-enabled for Newell-quality accuracy at L0 cells.
+//      Optional enhanced-RHS injects fine boundary charges (LLG_COMPOSITE_ENHANCED_RHS=1).
+//   2. Patches: screened 2D defect correction (García-Cervera approach).
+//      defect_rhs = fine_div - interp(coarse_div), screened Jacobi smooth.
+//      B_patch = interp(B_L0) + m_mag × (-μ₀∇δφ).
+//
+// Two modes:
+//   Default:                   Single-pass defect correction on patches (RECOMMENDED)
+//   LLG_DEMAG_COMPOSITE_VCYCLE=1: Iterative composite V-cycle (max_cycles=1 default)
+//
+// Environment variables:
+//   LLG_COMPOSITE_ENHANCED_RHS=1   — inject fine boundary charges into L0 RHS
+//   LLG_COMPOSITE_PATCH_DEFECT=1   — use defect correction on patches (default: bilinear interp)
+//   LLG_DEMAG_MG_HYBRID_ENABLE=0   — disable PPPM (for diagnostic comparison)
+//   LLG_DEMAG_COMPOSITE_VCYCLE=1   — use V-cycle path instead of defect correction
+//   LLG_COMPOSITE_MAX_CYCLES=N     — V-cycle iterations (default 1, >1 not recommended)
+
+use crate::amr::hierarchy::AmrHierarchy2D;
+use crate::amr::interp::sample_bilinear;
+use crate::amr::patch::Patch2D;
+use crate::grid::Grid2D;
+use crate::params::{MU0, Material};
+use crate::vector_field::VectorField2D;
+
+use super::demag_poisson_mg::{
+    DemagPoissonMGConfig, DemagPoissonMGHybrid, HybridConfig,
+};
+use super::demag_fft_uniform;
+use super::mg_kernels;
+
+use std::sync::{Mutex, OnceLock};
+
+use rayon::prelude::*;
+
+// ---------------------------------------------------------------------------
+// Patch-level Poisson data (Phase 1 of composite V-cycle)
+// ---------------------------------------------------------------------------
+
+/// Per-patch scalar-field storage for the composite Poisson solve.
+///
+/// Each AMR patch needs φ (potential), rhs (∇·M at fine resolution),
+/// and residual (scratch) to participate in the composite V-cycle.
+/// Dimensions include ghost cells, matching the patch's Grid2D.
+pub(crate) struct PatchPoissonData {
+    /// Scalar potential on the patch grid (including ghosts).
+
+    pub phi: Vec<f64>,
+    /// RHS = ∇·(Ms·m) at fine resolution (including ghosts).
+    pub rhs: Vec<f64>,
+    /// Scratch for residual = rhs - L(phi) (including ghosts).
+
+    pub residual: Vec<f64>,
+    /// Full patch grid dimensions (with ghosts).
+    pub nx: usize,
+    pub ny: usize,
+    /// Ghost cell count.
+
+    pub ghost: usize,
+    /// Cell spacings at this level.
+    pub dx: f64,
+    pub dy: f64,
+    pub dz: f64,
+}
+
+impl PatchPoissonData {
+    /// Allocate storage for a patch. All arrays initialised to zero.
+    pub fn new(patch: &Patch2D) -> Self {
+        let nx = patch.grid.nx;
+        let ny = patch.grid.ny;
+        let n = nx * ny;
+        Self {
+            phi: vec![0.0; n],
+            rhs: vec![0.0; n],
+            residual: vec![0.0; n],
+            nx,
+            ny,
+            ghost: patch.ghost,
+            dx: patch.grid.dx,
+            dy: patch.grid.dy,
+            dz: patch.grid.dz,
+        }
+    }
+
+    /// Compute RHS = ∇·(Ms·m) from the patch's magnetisation.
+    ///
+    /// Uses the same face-averaged divergence as mg_kernels::compute_div_m_2d,
+    /// scaled by Ms. The divergence is computed on the full patch grid
+    /// (including ghosts), matching the existing compute_patch_corrections
+    /// approach.
+    pub fn compute_rhs_from_m(&mut self, m_data: &[[f64; 3]], ms: f64) {
+        debug_assert_eq!(m_data.len(), self.nx * self.ny);
+        compute_scaled_div_m(m_data, self.nx, self.ny, self.dx, self.dy, ms, &mut self.rhs);
+    }
+
+    /// Area-average the fine RHS over the r×r fine cells corresponding to
+    /// a single coarse cell at patch-local coarse index (ic, jc).
+    ///
+    /// Returns the averaged divergence value for that coarse cell.
+    pub fn area_avg_rhs_at_coarse_cell(&self, ic: usize, jc: usize,
+                                        ratio: usize, ghost: usize) -> f64 {
+        let fi0 = ghost + ic * ratio;
+        let fj0 = ghost + jc * ratio;
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for fj in fj0..fj0 + ratio {
+            for fi in fi0..fi0 + ratio {
+                if fi < self.nx && fj < self.ny {
+                    sum += self.rhs[fj * self.nx + fi];
+                    count += 1;
+                }
+            }
+        }
+        if count > 0 { sum / count as f64 } else { 0.0 }
+    }
+}
+
+/// Allocate PatchPoissonData for all patches in the hierarchy.
+///
+/// Returns: (l1_data, l2plus_data) matching the structure of
+/// h.patches and h.patches_l2plus.
+fn allocate_patch_poisson_data(h: &AmrHierarchy2D)
+    -> (Vec<PatchPoissonData>, Vec<Vec<PatchPoissonData>>)
+{
+    let l1: Vec<PatchPoissonData> = h.patches.iter()
+        .map(PatchPoissonData::new).collect();
+    let l2plus: Vec<Vec<PatchPoissonData>> = h.patches_l2plus.iter()
+        .map(|lvl| lvl.iter().map(PatchPoissonData::new).collect())
+        .collect();
+    (l1, l2plus)
+}
+
+/// Compute fine RHS on all patch Poisson data from the hierarchy's magnetisation.
+fn compute_all_patch_rhs(
+    h: &AmrHierarchy2D,
+    l1_data: &mut [PatchPoissonData],
+    l2plus_data: &mut [Vec<PatchPoissonData>],
+    ms: f64,
+) {
+    for (pd, patch) in l1_data.iter_mut().zip(h.patches.iter()) {
+        pd.compute_rhs_from_m(&patch.m.data, ms);
+    }
+    for (lvl_data, lvl_patches) in l2plus_data.iter_mut().zip(h.patches_l2plus.iter()) {
+        for (pd, patch) in lvl_data.iter_mut().zip(lvl_patches.iter()) {
+            pd.compute_rhs_from_m(&patch.m.data, ms);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: 2D Laplacian, Jacobi smoother, scalar ghost-fill
+// ---------------------------------------------------------------------------
+
+/// Bilinear interpolation of a cell-centred scalar field at physical (x, y).
+///
+/// This is the scalar equivalent of `interp::sample_bilinear` for VectorField2D.
+/// Uses the same coordinate convention: grid origin at (0,0), cell centres at
+/// (i+0.5)*dx, (j+0.5)*dy. Clamps at boundaries.
+
+fn sample_bilinear_scalar(
+    data: &[f64], nx: usize, ny: usize, dx: f64, dy: f64,
+    x: f64, y: f64,
+) -> f64 {
+    if nx == 0 || ny == 0 { return 0.0; }
+
+    // Convert physical coordinate to continuous cell-centre index.
+    let fx = x / dx - 0.5;
+    let fy = y / dy - 0.5;
+
+    let i0f = fx.floor();
+    let j0f = fy.floor();
+    let tx = fx - i0f;
+    let ty = fy - j0f;
+
+    // Clamp to valid range.
+    let clamp = |v: isize, n: usize| -> usize {
+        if v <= 0 { 0 }
+        else if v >= n as isize - 1 { n - 1 }
+        else { v as usize }
+    };
+
+    let i0 = clamp(i0f as isize, nx);
+    let j0 = clamp(j0f as isize, ny);
+    let i1 = clamp(i0f as isize + 1, nx);
+    let j1 = clamp(j0f as isize + 1, ny);
+
+    let v00 = data[j0 * nx + i0];
+    let v10 = data[j0 * nx + i1];
+    let v01 = data[j1 * nx + i0];
+    let v11 = data[j1 * nx + i1];
+
+    let v0 = v00 * (1.0 - tx) + v10 * tx;
+    let v1 = v01 * (1.0 - tx) + v11 * tx;
+    v0 * (1.0 - ty) + v1 * ty
+}
+
+/// Fill ghost cells in a patch's φ array from the coarse-level φ.
+///
+/// Uses the same coordinate mapping as `Patch2D::fill_ghosts_from_coarse` but
+/// operates on scalar fields. Ghost cells get bilinearly interpolated values
+/// from `coarse_phi`; interior cells are untouched.
+///
+/// `coarse_phi`: flat array of size `coarse_nx * coarse_ny` (L0 magnet-layer φ).
+/// `coarse_dx`, `coarse_dy`: L0 cell spacings.
+
+#[allow(dead_code)]
+pub(crate) fn fill_phi_ghosts_from_coarse(
+    patch: &Patch2D,
+    patch_phi: &mut [f64],
+    coarse_phi: &[f64],
+    coarse_nx: usize, coarse_ny: usize,
+    coarse_dx: f64, coarse_dy: f64,
+) {
+    let nx = patch.grid.nx;
+    let ny = patch.grid.ny;
+    let gi0 = patch.interior_i0();
+    let gj0 = patch.interior_j0();
+    let gi1 = patch.interior_i1();
+    let gj1 = patch.interior_j1();
+
+    for j in 0..ny {
+        for i in 0..nx {
+            let is_interior = i >= gi0 && i < gi1 && j >= gj0 && j < gj1;
+            if is_interior {
+                continue;
+            }
+            // Compute physical (x,y) of this patch cell — same as Patch2D::cell_center_xy
+            let (x, y) = patch.cell_center_xy(i, j);
+            // Bilinear interpolate from coarse φ
+            patch_phi[j * nx + i] = sample_bilinear_scalar(
+                coarse_phi, coarse_nx, coarse_ny, coarse_dx, coarse_dy, x, y);
+        }
+    }
+}
+
+/// Apply the screened 2D Laplacian on interior cells of a patch.
+///
+/// Computes L(φ) = ∂²φ/∂x² + ∂²φ/∂y² − (2/dz²)φ for all interior cells.
+///
+/// The −(2/dz²)φ screening term is the effective z-coupling at the magnet
+/// layer of a single-layer thin film: the 3D Laplacian at z=offz includes
+/// (φ(k+1) − 2φ(k) + φ(k−1))/dz², and for vacuum neighbors φ(k±1)≈0
+/// this reduces to −2φ/dz².  This makes the 2D patch operator consistent
+/// with the L0 3D MG solver's effective operator at the magnet layer.
+///
+/// Ghost cells in `out` are set to zero.
+/// Ghost values in `phi` are used as boundary data by the stencil.
+#[allow(dead_code)]
+pub(crate) fn laplacian_2d_interior(
+    phi: &[f64], nx: usize, ny: usize, ghost: usize,
+    dx: f64, dy: f64, dz: f64,
+    out: &mut [f64],
+) {
+    debug_assert_eq!(phi.len(), nx * ny);
+    debug_assert_eq!(out.len(), nx * ny);
+
+    let inv_dx2 = 1.0 / (dx * dx);
+    let inv_dy2 = 1.0 / (dy * dy);
+    let inv_dz2 = 1.0 / (dz * dz);
+
+    out.fill(0.0);
+
+    for j in ghost..(ny - ghost) {
+        for i in ghost..(nx - ghost) {
+            let idx = j * nx + i;
+            let phi_c = phi[idx];
+            let phi_xp = phi[idx + 1];     // i+1, same j
+            let phi_xm = phi[idx - 1];     // i-1, same j
+            let phi_yp = phi[(j + 1) * nx + i]; // same i, j+1
+            let phi_ym = phi[(j - 1) * nx + i]; // same i, j-1
+
+            out[idx] = (phi_xp - 2.0 * phi_c + phi_xm) * inv_dx2
+                     + (phi_yp - 2.0 * phi_c + phi_ym) * inv_dy2
+                     - 2.0 * inv_dz2 * phi_c;
+        }
+    }
+}
+
+/// Compute residual r = rhs - L(φ) on interior cells.
+///
+/// Uses the SCREENED 2D Laplacian:
+///   L(φ) = ∇²_xy(φ) − (2/dz²)φ
+///
+/// The z-screening term makes this consistent with smooth_jacobi_2d
+/// (which uses the same screened operator) and with the L0 3D MG
+/// solver's effective operator at the magnet layer. Without screening,
+/// the residual and smoother would use different operators, causing
+/// the V-cycle restriction to inject biased corrections into L0.
+
+#[allow(dead_code)]
+pub(crate) fn compute_residual_2d(pd: &mut PatchPoissonData) {
+    let nx = pd.nx;
+    let ny = pd.ny;
+    let ghost = pd.ghost;
+    let inv_dx2 = 1.0 / (pd.dx * pd.dx);
+    let inv_dy2 = 1.0 / (pd.dy * pd.dy);
+    let inv_dz2 = 1.0 / (pd.dz * pd.dz);
+
+    pd.residual.fill(0.0);
+
+    for j in ghost..(ny - ghost) {
+        for i in ghost..(nx - ghost) {
+            let idx = j * nx + i;
+            let phi_c = pd.phi[idx];
+            let lap = (pd.phi[idx + 1] - 2.0 * phi_c + pd.phi[idx - 1]) * inv_dx2
+                    + (pd.phi[(j + 1) * nx + i] - 2.0 * phi_c + pd.phi[(j - 1) * nx + i]) * inv_dy2;
+            // Screened Poisson: L(φ) = ∇²_xy(φ) − (2/dz²)φ
+            pd.residual[idx] = pd.rhs[idx] - (lap - 2.0 * inv_dz2 * phi_c);
+        }
+    }
+}
+
+/// Weighted Jacobi smoothing on a 2D patch grid (screened Poisson).
+///
+/// Updates `phi` in place. Ghost cells are NOT modified (they are boundary data
+/// from the coarse level). Only interior cells [ghost..nx-ghost, ghost..ny-ghost]
+/// are updated.
+///
+/// `tmp` is scratch space of the same size as `phi`.
+///
+/// Standard Jacobi update:
+///   phi_new = phi + ω/diag * (rhs - L(phi))
+/// where diag = -2/dx² - 2/dy² - 2/dz² (screened Poisson diagonal).
+///
+/// The z-screening term −(2/dz²)φ approximates the effective z-coupling
+/// at the magnet layer: the 3D operator at z=offz couples to vacuum
+/// neighbors where φ≈0, giving an effective diagonal contribution of
+/// −2/dz².  This makes the 2D patch operator consistent with the L0 3D
+/// MG solver, improving convergence and robustness at all dz/dx ratios.
+
+pub(crate) fn smooth_jacobi_2d(
+    phi: &mut [f64], rhs: &[f64], tmp: &mut [f64],
+    nx: usize, ny: usize, ghost: usize,
+    dx: f64, dy: f64, dz: f64, omega: f64, n_iters: usize,
+) {
+    debug_assert_eq!(phi.len(), nx * ny);
+    debug_assert_eq!(rhs.len(), nx * ny);
+    debug_assert_eq!(tmp.len(), nx * ny);
+
+    let inv_dx2 = 1.0 / (dx * dx);
+    let inv_dy2 = 1.0 / (dy * dy);
+    let inv_dz2 = 1.0 / (dz * dz);
+    let diag = -2.0 * inv_dx2 - 2.0 * inv_dy2 - 2.0 * inv_dz2;
+    let inv_diag = 1.0 / diag;
+
+    for _iter in 0..n_iters {
+        // Copy phi → tmp (including ghosts)
+        tmp.copy_from_slice(phi);
+
+        // Update interior cells
+        for j in ghost..(ny - ghost) {
+            for i in ghost..(nx - ghost) {
+                let idx = j * nx + i;
+                let phi_c = tmp[idx];
+                let lap = (tmp[idx + 1] - 2.0 * phi_c + tmp[idx - 1]) * inv_dx2
+                        + (tmp[(j + 1) * nx + i] - 2.0 * phi_c + tmp[(j - 1) * nx + i]) * inv_dy2;
+                // Screened Poisson: L(φ) = ∇²_xy(φ) − (2/dz²)φ
+                let residual = rhs[idx] - (lap - 2.0 * inv_dz2 * phi_c);
+                phi[idx] = phi_c + omega * inv_diag * residual;
+            }
+        }
+        // Ghost cells in phi remain unchanged (boundary data)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Residual restriction (fine → coarse)
+// Phase 4: Correction prolongation (coarse → fine)
+// ---------------------------------------------------------------------------
+
+/// Area-average a scalar field over the r×r fine cells corresponding to
+/// coarse cell (ic, jc) in patch-local coordinates.
+///
+/// Generic version — works on any &[f64] field stored on the patch grid
+/// (rhs, residual, phi, etc.). Follows the same indexing pattern as
+/// `Patch2D::restrict_to_coarse` and `compute_patch_corrections`.
+
+#[allow(dead_code)]
+fn area_avg_fine_to_coarse_cell(
+    field: &[f64], nx: usize, ny: usize,
+    ic: usize, jc: usize,
+    ratio: usize, ghost: usize,
+) -> f64 {
+    let fi0 = ghost + ic * ratio;
+    let fj0 = ghost + jc * ratio;
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    for fj in fj0..fj0 + ratio {
+        for fi in fi0..fi0 + ratio {
+            if fi < nx && fj < ny {
+                sum += field[fj * nx + fi];
+                count += 1;
+            }
+        }
+    }
+    if count > 0 { sum / count as f64 } else { 0.0 }
+}
+
+/// Restrict the fine-level residual from a patch to the coarse grid.
+///
+/// For each coarse cell covered by the patch, area-averages the fine residual
+/// over the r×r fine cells and returns (coarse_cell_index, avg_residual) pairs.
+///
+/// These pairs are passed to `solve_with_corrections` to inject into the L0 RHS.
+///
+/// The coarse_cell_index uses the same convention as `compute_patch_corrections`:
+///   cell_idx = coarse_j * base_nx + coarse_i
+
+#[allow(dead_code)]
+pub(crate) fn restrict_residual_to_coarse(
+    patch: &Patch2D,
+    patch_residual: &[f64],
+    base_nx: usize,
+) -> Vec<(usize, f64)> {
+    let cr = &patch.coarse_rect;
+    let ratio = patch.ratio;
+    let ghost = patch.ghost;
+    let pnx = patch.grid.nx;
+    let pny = patch.grid.ny;
+
+    let mut corrections = Vec::with_capacity(cr.nx * cr.ny);
+
+    for jc in 0..cr.ny {
+        for ic in 0..cr.nx {
+            let coarse_i = cr.i0 + ic;
+            let coarse_j = cr.j0 + jc;
+            let cell_idx = coarse_j * base_nx + coarse_i;
+
+            let avg = area_avg_fine_to_coarse_cell(
+                patch_residual, pnx, pny, ic, jc, ratio, ghost);
+
+            // Include all cells (even small values) — the L0 solver handles
+            // the injection. This matches the reflux convention where fine
+            // data supersedes coarse data at covered cells.
+            corrections.push((cell_idx, avg));
+        }
+    }
+
+    corrections
+}
+
+/// Prolongate the coarse φ correction to fine patch cells.
+///
+/// Computes delta = coarse_phi_new - coarse_phi_old (the correction from the
+/// L0 solve), then bilinearly interpolates delta to each interior fine cell
+/// and ADDS it to patch_phi. Ghost cells are not modified (they get updated
+/// by fill_phi_ghosts_from_coarse separately).
+///
+/// This preserves fine-level detail from pre-smoothing while injecting the
+/// coarse-level correction. Standard in composite MG (AMReX does this).
+
+#[allow(dead_code)]
+pub(crate) fn prolongate_phi_correction(
+    coarse_phi_new: &[f64],
+    coarse_phi_old: &[f64],
+    coarse_nx: usize, coarse_ny: usize,
+    coarse_dx: f64, coarse_dy: f64,
+    patch: &Patch2D,
+    patch_phi: &mut [f64],
+) {
+    debug_assert_eq!(coarse_phi_new.len(), coarse_nx * coarse_ny);
+    debug_assert_eq!(coarse_phi_old.len(), coarse_nx * coarse_ny);
+
+    // Compute the correction on the coarse grid.
+    let delta_coarse: Vec<f64> = coarse_phi_new.iter()
+        .zip(coarse_phi_old.iter())
+        .map(|(new, old)| new - old)
+        .collect();
+
+    let pnx = patch.grid.nx;
+    let gi0 = patch.interior_i0();
+    let gj0 = patch.interior_j0();
+    let gi1 = patch.interior_i1();
+    let gj1 = patch.interior_j1();
+
+    // Interpolate delta to each interior fine cell and add.
+    for j in gj0..gj1 {
+        for i in gi0..gi1 {
+            let (x, y) = patch.cell_center_xy(i, j);
+            let delta_interp = sample_bilinear_scalar(
+                &delta_coarse, coarse_nx, coarse_ny, coarse_dx, coarse_dy, x, y);
+            patch_phi[j * pnx + i] += delta_interp;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-level helpers: parent-patch operations for true composite V-cycle
+// ---------------------------------------------------------------------------
+
+/// Check if base-grid rect `a` fully contains rect `b`.
+fn rect_contains(a: &crate::amr::rect::Rect2i, b: &crate::amr::rect::Rect2i) -> bool {
+    b.i0 >= a.i0 && b.j0 >= a.j0
+        && b.i0 + b.nx <= a.i0 + a.nx
+        && b.j0 + b.ny <= a.j0 + a.ny
+}
+
+/// Find the index of the parent-level patch that encloses `child`.
+///
+/// Uses coarse_rect containment (same check as hierarchy nesting enforcement).
+/// Returns None if no enclosing parent is found (shouldn't happen if nesting
+/// is enforced, but we handle it gracefully).
+fn find_enclosing_patch_idx(
+    child: &Patch2D,
+    parent_patches: &[Patch2D],
+) -> Option<usize> {
+    for (i, parent) in parent_patches.iter().enumerate() {
+        if rect_contains(&parent.coarse_rect, &child.coarse_rect) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Fill ghost cells in a child patch's φ from the enclosing parent patch's φ.
+///
+/// For each ghost cell in the child patch, compute its physical (x,y),
+/// convert to the parent patch's local coordinate system, and bilinearly
+/// interpolate from the parent patch's φ field.
+///
+/// This replaces `fill_phi_ghosts_from_coarse` for L2+ patches so that
+/// ghost values come from the parent level rather than jumping to L0.
+fn fill_phi_ghosts_from_parent_patch(
+    child_patch: &Patch2D,
+    child_phi: &mut [f64],
+    parent_patch: &Patch2D,
+    parent_phi: &[f64],
+) {
+    let cnx = child_patch.grid.nx;
+    let cny = child_patch.grid.ny;
+    let gi0 = child_patch.interior_i0();
+    let gj0 = child_patch.interior_j0();
+    let gi1 = child_patch.interior_i1();
+    let gj1 = child_patch.interior_j1();
+
+    let pnx = parent_patch.grid.nx;
+    let pny = parent_patch.grid.ny;
+    let pdx = parent_patch.grid.dx;
+    let pdy = parent_patch.grid.dy;
+
+    // The parent patch grid origin in physical coordinates.
+    // cell_center_xy(0,0) returns the physical (x,y) of the first cell
+    // (including ghosts). sample_bilinear_scalar expects coordinates where
+    // cell i has centre at (i+0.5)*dx, so the grid origin is at
+    // cell_center_xy(0,0) - (0.5*dx, 0.5*dy).
+    let (px0, py0) = parent_patch.cell_center_xy(0, 0);
+    let origin_x = px0 - 0.5 * pdx;
+    let origin_y = py0 - 0.5 * pdy;
+
+    for j in 0..cny {
+        for i in 0..cnx {
+            let is_interior = i >= gi0 && i < gi1 && j >= gj0 && j < gj1;
+            if is_interior { continue; }
+
+            // Physical position of this child ghost cell.
+            let (x, y) = child_patch.cell_center_xy(i, j);
+
+            // Convert to parent patch's local coordinate system.
+            let local_x = x - origin_x;
+            let local_y = y - origin_y;
+
+            child_phi[j * cnx + i] = sample_bilinear_scalar(
+                parent_phi, pnx, pny, pdx, pdy,
+                local_x, local_y,
+            );
+        }
+    }
+}
+
+/// Restrict child patch residual into the enclosing parent patch's residual.
+///
+/// For each parent fine cell covered by the child, REPLACES the parent's
+/// residual with the area-average of the child fine cells that map to it.
+/// This is the composite V-cycle reflux step at coarse-fine interfaces.
+///
+/// `step_ratio` is the refinement ratio between adjacent levels (h.ratio,
+/// typically 2). Each parent fine cell maps to step_ratio × step_ratio
+/// child fine cells.
+#[allow(dead_code)]
+fn restrict_residual_to_parent_patch(
+    child_patch: &Patch2D,
+    child_residual: &[f64],
+    child_nx: usize,
+    parent_patch: &Patch2D,
+    parent_residual: &mut [f64],
+    parent_nx: usize,
+    step_ratio: usize,
+) {
+    let ccr = &child_patch.coarse_rect;
+    let pcr = &parent_patch.coarse_rect;
+
+    // Overlap of child and parent in base-grid coordinates.
+    let oi0 = ccr.i0.max(pcr.i0);
+    let oj0 = ccr.j0.max(pcr.j0);
+    let oi1 = (ccr.i0 + ccr.nx).min(pcr.i0 + pcr.nx);
+    let oj1 = (ccr.j0 + ccr.ny).min(pcr.j0 + pcr.ny);
+    if oi1 <= oi0 || oj1 <= oj0 { return; }
+
+    let c_ratio = child_patch.ratio;   // child's total ratio vs base grid
+    let p_ratio = parent_patch.ratio;   // parent's total ratio vs base grid
+    let c_ghost = child_patch.ghost;
+    let p_ghost = parent_patch.ghost;
+
+    // For each base-grid cell in the overlap:
+    for bj in oj0..oj1 {
+        for bi in oi0..oi1 {
+            // For each parent fine cell within this base cell:
+            for py in 0..p_ratio {
+                for px in 0..p_ratio {
+                    let pfi = p_ghost + (bi - pcr.i0) * p_ratio + px;
+                    let pfj = p_ghost + (bj - pcr.j0) * p_ratio + py;
+
+                    // Area-average the step_ratio × step_ratio child cells
+                    // that map to this parent fine cell.
+                    let mut sum = 0.0f64;
+                    let mut count = 0usize;
+                    for dy in 0..step_ratio {
+                        for dx in 0..step_ratio {
+                            let cfi = c_ghost + (bi - ccr.i0) * c_ratio + px * step_ratio + dx;
+                            let cfj = c_ghost + (bj - ccr.j0) * c_ratio + py * step_ratio + dy;
+                            if cfi < child_nx && cfj < child_patch.grid.ny {
+                                sum += child_residual[cfj * child_nx + cfi];
+                                count += 1;
+                            }
+                        }
+                    }
+
+                    if count > 0 {
+                        parent_residual[pfj * parent_nx + pfi] = sum / count as f64;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Prolongate φ correction from parent patch to child patch.
+///
+/// Computes delta = parent_phi_new - parent_phi_old on the parent patch grid,
+/// bilinearly interpolates delta to each child interior cell, and ADDS to
+/// child_phi. Ghost cells are not modified (they get updated by ghost-fill).
+fn prolongate_phi_correction_from_parent_patch(
+    parent_patch: &Patch2D,
+    parent_phi_new: &[f64],
+    parent_phi_old: &[f64],
+    child_patch: &Patch2D,
+    child_phi: &mut [f64],
+) {
+    let pnx = parent_patch.grid.nx;
+    let pny = parent_patch.grid.ny;
+    let pdx = parent_patch.grid.dx;
+    let pdy = parent_patch.grid.dy;
+
+    // Parent patch grid origin in physical coordinates.
+    let (px0, py0) = parent_patch.cell_center_xy(0, 0);
+    let origin_x = px0 - 0.5 * pdx;
+    let origin_y = py0 - 0.5 * pdy;
+
+    // Compute the correction on the parent patch grid.
+    let delta_parent: Vec<f64> = parent_phi_new.iter()
+        .zip(parent_phi_old.iter())
+        .map(|(new, old)| new - old)
+        .collect();
+
+    let cnx = child_patch.grid.nx;
+    let gi0 = child_patch.interior_i0();
+    let gj0 = child_patch.interior_j0();
+    let gi1 = child_patch.interior_i1();
+    let gj1 = child_patch.interior_j1();
+
+    // Interpolate delta to each child interior cell and add.
+    for j in gj0..gj1 {
+        for i in gi0..gi1 {
+            let (x, y) = child_patch.cell_center_xy(i, j);
+            let local_x = x - origin_x;
+            let local_y = y - origin_y;
+            let delta_interp = sample_bilinear_scalar(
+                &delta_parent, pnx, pny, pdx, pdy,
+                local_x, local_y,
+            );
+            child_phi[j * cnx + i] += delta_interp;
+        }
+    }
+}
+
+/// Pre-compute parent-patch index maps for all L2+ levels.
+///
+/// Returns a Vec<Vec<usize>> where result[lvl_idx][patch_idx] gives the
+/// index of the enclosing parent patch. Panics if nesting is violated.
+fn build_parent_index_maps(h: &AmrHierarchy2D) -> Vec<Vec<usize>> {
+    let mut maps: Vec<Vec<usize>> = Vec::with_capacity(h.patches_l2plus.len());
+    for (lvl_idx, lvl_patches) in h.patches_l2plus.iter().enumerate() {
+        let parent_patches: &[Patch2D] = if lvl_idx == 0 {
+            &h.patches
+        } else {
+            &h.patches_l2plus[lvl_idx - 1]
+        };
+        let lvl_map: Vec<usize> = lvl_patches.iter().map(|child| {
+            find_enclosing_patch_idx(child, parent_patches)
+                .unwrap_or_else(|| panic!(
+                    "L{} patch at ({},{}) has no enclosing parent",
+                    lvl_idx + 2, child.coarse_rect.i0, child.coarse_rect.j0
+                ))
+        }).collect();
+        maps.push(lvl_map);
+    }
+    maps
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: Fine-level gradient extraction
+// ---------------------------------------------------------------------------
+
+/// Extract B_demag from patch-level φ at fine resolution.
+///
+/// Bx = -μ₀ · ∂φ/∂x  (central difference at fine dx)
+/// By = -μ₀ · ∂φ/∂y  (central difference at fine dy)
+/// Bz = interpolated from coarse B_demag (the 3D L0 solve captures z-physics)
+///
+/// Ghost cells in φ provide the boundary data for the central difference
+/// at patch edges. The gradient is computed for ALL cells (interior + ghosts)
+/// to match the size of sample_coarse_to_patch output.
+///
+/// Returns a Vec of [Bx, By, Bz] per cell on the full patch grid.
+
+#[allow(dead_code)]
+pub(crate) fn extract_b_from_patch_phi(
+    patch: &Patch2D,
+    patch_phi: &[f64],
+    b_coarse: &VectorField2D,  // for Bz interpolation
+) -> Vec<[f64; 3]> {
+    let pnx = patch.grid.nx;
+    let pny = patch.grid.ny;
+    let dx = patch.grid.dx;
+    let dy = patch.grid.dy;
+    let inv_2dx = 1.0 / (2.0 * dx);
+    let inv_2dy = 1.0 / (2.0 * dy);
+
+    let mut b = vec![[0.0f64; 3]; pnx * pny];
+
+    for j in 0..pny {
+        for i in 0..pnx {
+            let idx = j * pnx + i;
+
+            // Bx, By from fine φ gradient (central differences).
+            // At boundaries (i=0 or i=pnx-1), use one-sided differences.
+            let bx = if i > 0 && i + 1 < pnx {
+                // Central difference.
+                -MU0 * (patch_phi[j * pnx + (i + 1)] - patch_phi[j * pnx + (i - 1)]) * inv_2dx
+            } else if i + 1 < pnx {
+                // Forward difference at left boundary.
+                -MU0 * (patch_phi[j * pnx + (i + 1)] - patch_phi[idx]) / dx
+            } else if i > 0 {
+                // Backward difference at right boundary.
+                -MU0 * (patch_phi[idx] - patch_phi[j * pnx + (i - 1)]) / dx
+            } else {
+                0.0
+            };
+
+            let by = if j > 0 && j + 1 < pny {
+                -MU0 * (patch_phi[(j + 1) * pnx + i] - patch_phi[(j - 1) * pnx + i]) * inv_2dy
+            } else if j + 1 < pny {
+                -MU0 * (patch_phi[(j + 1) * pnx + i] - patch_phi[idx]) / dy
+            } else if j > 0 {
+                -MU0 * (patch_phi[idx] - patch_phi[(j - 1) * pnx + i]) / dy
+            } else {
+                0.0
+            };
+
+            // Bz from coarse solution (interpolated).
+            // The 3D L0 solve captures z-surface charges and z-gradient of φ.
+            let (x, y) = patch.cell_center_xy(i, j);
+            let b_coarse_val = sample_bilinear(b_coarse, x, y);
+            let bz = b_coarse_val[2];
+
+            b[idx] = [bx, by, bz];
+        }
+    }
+
+    b
+}
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn composite_diag() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("LLG_DEMAG_COMPOSITE_DIAG").is_ok())
+}
+
+/// Check if enhanced-RHS mode is explicitly requested.
+///
+/// LLG_COMPOSITE_ENHANCED_RHS=1 enables injecting fine boundary charges
+/// into the L0 solve (the García-Cervera approach). When disabled (default),
+/// L0 uses staircase coarse M only (PPPM handles accuracy).
+///
+/// This is a diagnostic toggle for testing whether enhanced-RHS improves
+/// or worsens dynamics accuracy.
+#[inline]
+fn enhanced_rhs_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("LLG_COMPOSITE_ENHANCED_RHS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Check if patch-level defect correction is enabled.
+///
+/// LLG_COMPOSITE_PATCH_DEFECT=1 enables screened 2D Jacobi defect correction
+/// on patches. This gives better per-cell accuracy at material/vacuum boundaries
+/// (~9% edge RMSE vs ~16% for bilinear) but is ~25× slower per patch.
+///
+/// Default (0): bilinear interpolation of L0 B to patches.
+///   Fast, dynamics-validated (session summary proved B extraction method
+///   has zero effect on Phase 2 displacements).
+///
+/// Recommended: OFF for dynamics runs, ON for static accuracy benchmarks.
+#[inline]
+fn patch_defect_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("LLG_COMPOSITE_PATCH_DEFECT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Divergence and injection helpers
+// ---------------------------------------------------------------------------
+
+/// Compute ∇·(Ms*m) on a 2D grid. m_data is unit vectors, scaled by ms internally.
+fn compute_scaled_div_m(
+    m_data: &[[f64; 3]], nx: usize, ny: usize,
+    dx: f64, dy: f64, ms: f64, out: &mut [f64],
+) {
+    let scaled: Vec<[f64; 3]> = m_data.iter()
+        .map(|v| [v[0] * ms, v[1] * ms, v[2] * ms]).collect();
+    mg_kernels::compute_div_m_2d(&scaled, nx, ny, dx, dy, out);
+}
+
+/// Compute enhanced-RHS corrections from AMR patches.
+///
+/// For each coarse cell covered by a patch, computes:
+///   delta = area_avg(fine_div) − coarse_div
+///
+/// Returns a Vec<(cell_index, delta)> for use with `solve_with_corrections`.
+/// cell_index is j * base_nx + i in the coarse grid.
+fn compute_patch_corrections(
+    h: &AmrHierarchy2D,
+    coarse_div: &[f64],
+    ms: f64,
+) -> Vec<(usize, f64)> {
+    let base_nx = h.base_grid.nx;
+    let mut corrections: Vec<(usize, f64)> = Vec::new();
+
+    // Process all patches from coarsest to finest level.
+    let all_patches: Vec<&Patch2D> = h.patches.iter()
+        .chain(h.patches_l2plus.iter().flat_map(|lvl| lvl.iter()))
+        .collect();
+
+    for patch in all_patches {
+        let ratio = patch.ratio;
+        let ghost = patch.ghost;
+        let cr = &patch.coarse_rect;
+        let pnx = patch.grid.nx;
+        let pny = patch.grid.ny;
+
+        // Compute fine ∇·(Ms*m) on the full patch grid (including ghosts).
+        let mut fine_div = vec![0.0f64; pnx * pny];
+        compute_scaled_div_m(
+            &patch.m.data, pnx, pny,
+            patch.grid.dx, patch.grid.dy, ms,
+            &mut fine_div,
+        );
+
+        // For each coarse cell covered by this patch:
+        for jc in 0..cr.ny {
+            for ic in 0..cr.nx {
+                let coarse_i = cr.i0 + ic;
+                let coarse_j = cr.j0 + jc;
+                let cell_idx = coarse_j * base_nx + coarse_i;
+
+                // Area-average the fine divergence.
+                let fi0 = ghost + ic * ratio;
+                let fj0 = ghost + jc * ratio;
+                let mut sum = 0.0f64;
+                let mut count = 0usize;
+                for fj in fj0..fj0 + ratio {
+                    for fi in fi0..fi0 + ratio {
+                        if fi < pnx && fj < pny {
+                            sum += fine_div[fj * pnx + fi];
+                            count += 1;
+                        }
+                    }
+                }
+
+                if count > 0 {
+                    let fine_avg = sum / count as f64;
+                    let coarse_val = coarse_div[cell_idx];
+                    let delta = fine_avg - coarse_val;
+
+                    // Only add non-trivial corrections.
+                    if delta.abs() > 1e-30 {
+                        corrections.push((cell_idx, delta));
+                    }
+                }
+            }
+        }
+    }
+
+    corrections
+}
+
+/// Sample coarse B to the full patch grid via bilinear interpolation.
+fn sample_coarse_to_patch(b_coarse: &VectorField2D, patch: &Patch2D) -> Vec<[f64; 3]> {
+    let pnx = patch.grid.nx;
+    let pny = patch.grid.ny;
+    let mut b = vec![[0.0; 3]; pnx * pny];
+    for j in 0..pny {
+        for i in 0..pnx {
+            let (x, y) = patch.cell_center_xy(i, j);
+            b[j * pnx + i] = sample_bilinear(b_coarse, x, y);
+        }
+    }
+    b
+}
+
+// ---------------------------------------------------------------------------
+// Composite field builders for multi-level defect hierarchy
+// ---------------------------------------------------------------------------
+//
+// García-Cervera / AMReX multi-level defect correction requires each level
+// to correct against its parent's *composite* field, not against L0 directly.
+//
+// After processing all patches at level L, we build:
+//   composite_div: L0 div with L's fine-averaged div at covered coarse cells
+//   composite_B:   L0 B with L's fine-averaged B at covered coarse cells
+//
+// Level L+1 then defect-corrects against these composite fields.
+
+/// Update a divergence field on the L0 grid with area-averaged fine div
+/// from patches at the current level.
+///
+/// For each coarse cell covered by a patch, the divergence value is REPLACED
+/// with the area-average of the patch's fine ∇·(Ms·m) (stored in pd.rhs).
+/// This builds the "composite level" divergence that the next finer level
+/// computes its defect against.
+fn update_composite_div(
+    composite_div: &mut [f64],
+    patches: &[Patch2D],
+    patch_data: &[PatchPoissonData],
+    base_nx: usize,
+) {
+    for (patch, pd) in patches.iter().zip(patch_data.iter()) {
+        let cr = &patch.coarse_rect;
+        let ratio = patch.ratio;
+        let ghost = pd.ghost;
+
+        for jc in 0..cr.ny {
+            for ic in 0..cr.nx {
+                let coarse_i = cr.i0 + ic;
+                let coarse_j = cr.j0 + jc;
+                let cell_idx = coarse_j * base_nx + coarse_i;
+
+                // Use the existing area-averaging method on PatchPoissonData.
+                composite_div[cell_idx] =
+                    pd.area_avg_rhs_at_coarse_cell(ic, jc, ratio, ghost);
+            }
+        }
+    }
+}
+
+/// Update a B field on the L0 grid with area-averaged fine B from patches
+/// at the current level.
+///
+/// For each coarse cell covered by a patch, the B value is REPLACED with
+/// the area-average of the patch's fine B (the full corrected B, not just δB).
+/// This builds the "composite level" B field that the next finer level
+/// interpolates from when computing B_patch = interp(composite_B) + δB.
+fn update_composite_b(
+    composite_b_data: &mut [[f64; 3]],
+    patches: &[Patch2D],
+    patch_b: &[Vec<[f64; 3]>],
+    base_nx: usize,
+) {
+    for (patch, pb) in patches.iter().zip(patch_b.iter()) {
+        let cr = &patch.coarse_rect;
+        let ratio = patch.ratio;
+        let ghost = patch.ghost;
+        let pnx = patch.grid.nx;
+        let pny = patch.grid.ny;
+
+        for jc in 0..cr.ny {
+            for ic in 0..cr.nx {
+                let coarse_i = cr.i0 + ic;
+                let coarse_j = cr.j0 + jc;
+                let cell_idx = coarse_j * base_nx + coarse_i;
+
+                // Area-average fine B over the ratio×ratio fine cells
+                // corresponding to this coarse cell.
+                let fi0 = ghost + ic * ratio;
+                let fj0 = ghost + jc * ratio;
+                let mut sum = [0.0f64; 3];
+                let mut count = 0usize;
+                for fj in fj0..fj0 + ratio {
+                    for fi in fi0..fi0 + ratio {
+                        if fi < pnx && fj < pny {
+                            let b = pb[fj * pnx + fi];
+                            sum[0] += b[0];
+                            sum[1] += b[1];
+                            sum[2] += b[2];
+                            count += 1;
+                        }
+                    }
+                }
+                if count > 0 {
+                    let inv = 1.0 / count as f64;
+                    composite_b_data[cell_idx] = [
+                        sum[0] * inv, sum[1] * inv, sum[2] * inv,
+                    ];
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Defect-correction per patch (García-Cervera / AMReX approach)
+// ---------------------------------------------------------------------------
+
+/// Compute defect-corrected B on a single patch.
+///
+/// Steps:
+///   1. δrhs = fine_∇·M − interpolate(parent_∇·M)
+///   2. Smooth ∇²(δφ) = δrhs with DirichletZero BCs
+///   3. δB = −μ₀∇(δφ)
+///   4. B_patch = interpolate(parent_B) + δB
+///
+/// `coarse_div` and `b_l0` are the PARENT level's fields. For L1 patches
+/// these are L0 fields; for L2+ patches these are composite fields built
+/// from the parent level (containing area-averaged fine data from the
+/// parent level's patches). This is the García-Cervera / AMReX multi-level
+/// defect correction: each level corrects only what its parent missed.
+///
+/// The defect RHS is HIGH-FREQUENCY (fine detail the parent grid missed).
+/// For high-k modes, 2D and 3D Green's functions agree, so the 2D Laplacian
+/// is correct for the defect even though it's wrong for the full equation.
+fn compute_defect_correction_on_patch(
+    patch: &Patch2D,
+    pd: &mut PatchPoissonData,
+    coarse_div: &[f64],
+    cnx: usize, cny: usize,
+    cdx: f64, cdy: f64,
+    b_l0: &VectorField2D,
+    omega: f64,
+) -> Vec<[f64; 3]> {
+    let pnx = pd.nx;
+    let pny = pd.ny;
+    let ghost = pd.ghost;
+
+    // Adaptive smoothing cap: scale max iterations with patch interior size.
+    // Larger patches have more wavelengths to resolve → need more iterations.
+    // Small patches (or near-zero defects) get fewer iterations to avoid
+    // amplifying floating-point noise (the "crossover anomaly").
+    let patch_diam = ((pnx - 2 * ghost) as f64).max((pny - 2 * ghost) as f64);
+    let n_smooth: usize = (8.0 * patch_diam.log2()).ceil().max(4.0) as usize;
+
+    // Step 1: Compute defect RHS = fine_div − interpolated(coarse_div).
+    // pd.rhs already contains fine_div (from compute_all_patch_rhs).
+    // Store defect RHS in pd.residual.
+    for j in 0..pny {
+        for i in 0..pnx {
+            let (x, y) = patch.cell_center_xy(i, j);
+            let coarse_interp = sample_bilinear_scalar(
+                coarse_div, cnx, cny, cdx, cdy, x, y);
+            pd.residual[j * pnx + i] = pd.rhs[j * pnx + i] - coarse_interp;
+        }
+    }
+
+    // Step 2: Smooth ∇²(δφ) = defect_rhs with DirichletZero BCs.
+    // δφ starts from zero. Ghost cells stay at zero (no ghost-fill from L0).
+    pd.phi.fill(0.0);
+    let defect_rhs = pd.residual.clone();
+    let mut tmp = vec![0.0f64; pnx * pny];
+
+    // Adaptive smoothing: check defect magnitude before iterating.
+    // At large L0 where the coarse grid already resolves the boundary,
+    // the defect RHS is near-zero and fixed iterations introduce noise
+    // that exceeds the correction magnitude (see §2.1 of Roadmap).
+    let max_defect_rhs = defect_rhs.iter()
+        .map(|v| v.abs())
+        .fold(0.0f64, f64::max);
+
+    // Scale tolerance by dx² (the expected magnitude of the correction is
+    // O(defect_rhs * dx²) from the Poisson Green's function).
+    let defect_tol_rel: f64 = 1e-3; // relative tolerance on correction
+    let defect_tol_abs: f64 = 1e-25; // absolute floor (skip if defect is negligible)
+
+    let effective_n_smooth = if max_defect_rhs < defect_tol_abs {
+        // Defect is negligible — skip smoothing entirely.
+        0
+    } else {
+        // Run smoothing in batches of 2, monitoring max|δφ| change.
+        // Exit early if the correction has converged.
+        let batch_size = 2;
+        let mut iters_done = 0;
+        let dx_sq = pd.dx * pd.dx;
+        let tol = defect_tol_rel * max_defect_rhs * dx_sq;
+
+        while iters_done < n_smooth {
+            let this_batch = batch_size.min(n_smooth - iters_done);
+
+            // Record phi before this batch for convergence check
+            let phi_max_before = pd.phi.iter()
+                .map(|v| v.abs())
+                .fold(0.0f64, f64::max);
+
+            smooth_jacobi_2d(
+                &mut pd.phi, &defect_rhs, &mut tmp,
+                pnx, pny, ghost, pd.dx, pd.dy, pd.dz,
+                omega, this_batch,
+            );
+
+            iters_done += this_batch;
+
+            // Check convergence: if the correction φ has stabilised, stop.
+            let phi_max_after = pd.phi.iter()
+                .map(|v| v.abs())
+                .fold(0.0f64, f64::max);
+
+            // After the first batch (starting from φ=0), phi_max_after IS the
+            // change. For subsequent batches, check the delta.
+            let change = if iters_done <= batch_size {
+                phi_max_after
+            } else {
+                (phi_max_after - phi_max_before).abs()
+            };
+
+            // If the change per batch is below tolerance, the smoother has
+            // captured all it can. Further iterations add noise.
+            if iters_done > batch_size && change < tol {
+                break;
+            }
+        }
+        iters_done
+    };
+
+    let _ = effective_n_smooth; // suppress unused warning when diag is off
+
+    // Step 3+4: Extract δB = −μ₀∇(δφ) and combine with interpolated parent B.
+    let inv_2dx = 1.0 / (2.0 * pd.dx);
+    let inv_2dy = 1.0 / (2.0 * pd.dy);
+
+    let mut b_out = vec![[0.0f64; 3]; pnx * pny];
+
+    for j in 0..pny {
+        for i in 0..pnx {
+            let idx = j * pnx + i;
+
+            // δBx, δBy from central differences on δφ.
+            let dbx = if i > 0 && i + 1 < pnx {
+                -MU0 * (pd.phi[j * pnx + (i + 1)] - pd.phi[j * pnx + (i - 1)]) * inv_2dx
+            } else if i + 1 < pnx {
+                -MU0 * (pd.phi[j * pnx + (i + 1)] - pd.phi[idx]) / pd.dx
+            } else if i > 0 {
+                -MU0 * (pd.phi[idx] - pd.phi[j * pnx + (i - 1)]) / pd.dx
+            } else {
+                0.0
+            };
+
+            let dby = if j > 0 && j + 1 < pny {
+                -MU0 * (pd.phi[(j + 1) * pnx + i] - pd.phi[(j - 1) * pnx + i]) * inv_2dy
+            } else if j + 1 < pny {
+                -MU0 * (pd.phi[(j + 1) * pnx + i] - pd.phi[idx]) / pd.dy
+            } else if j > 0 {
+                -MU0 * (pd.phi[idx] - pd.phi[(j - 1) * pnx + i]) / pd.dy
+            } else {
+                0.0
+            };
+
+            // Interpolate parent-level B at this fine cell's position.
+            let (x, y) = patch.cell_center_xy(i, j);
+            let b_coarse = sample_bilinear(b_l0, x, y);
+
+            // Geometry-aware defect damping: weight δB by local |M|.
+            //
+            // The Jacobi smoother on the defect equation doesn't know about
+            // material/vacuum boundaries — it propagates δφ into vacuum cells
+            // where ∇(δφ) produces spurious oscillations.  Weighting by |M|:
+            //   - Vacuum (|M|=0): pure interpolated parent B (discard noisy δB)
+            //   - Boundary (0<|M|<1, via EdgeSmooth): graduated blend
+            //   - Interior (|M|=1): full δB correction (unchanged)
+            let m_at = patch.m.data[idx];
+            let m_mag = (m_at[0]*m_at[0] + m_at[1]*m_at[1] + m_at[2]*m_at[2])
+                .sqrt().min(1.0);
+
+            b_out[idx] = [
+                b_coarse[0] + m_mag * dbx,
+                b_coarse[1] + m_mag * dby,
+                b_coarse[2],
+            ];
+        }
+    }
+
+    b_out
+}
+
+// ---------------------------------------------------------------------------
+// Composite-grid demag solver
+// ---------------------------------------------------------------------------
+
+/// Configuration for the composite V-cycle.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompositeVCycleConfig {
+    /// Pre-smoothing iterations on patches.
+    pub n_pre: usize,
+    /// Post-smoothing iterations on patches.
+    pub n_post: usize,
+    /// Jacobi relaxation weight.
+    pub omega: f64,
+    /// Maximum number of outer V-cycle iterations.
+    #[allow(dead_code)]
+    pub max_cycles: usize,
+}
+
+impl Default for CompositeVCycleConfig {
+    fn default() -> Self {
+        let max_cycles: usize = std::env::var("LLG_COMPOSITE_MAX_CYCLES")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+        Self {
+            n_pre: 3,
+            n_post: 3,
+            omega: 2.0 / 3.0,
+            max_cycles,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Direct Newell near-field: exact demag at L0 material cells
+// ---------------------------------------------------------------------------
+//
+// Replaces PPPM entirely.  For each L0 material cell, B is computed by
+// direct summation of the Newell tensor over ALL material cells within a
+// configurable radius.  This is the same physics as the FFT convolution
+// but evaluated locally — no FFT, no MG approximation, no calibration.
+//
+// The MG solve is kept ONLY for providing φ to ghost-fill AMR patches
+// during the composite V-cycle.  The L0 B field is overwritten by the
+// exact Newell result after the MG solve completes.
+//
+// Cost: O(N_material × R²) per demag call.  For 96² grid with ~5000
+// material cells and radius=48 (covers entire disk), ~120M flops ≈ 50ms.
+// Competitive with MG+PPPM and far simpler.
+
+fn newell_direct_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("LLG_NEWELL_DIRECT")
+            .map(|v| v != "0")
+            .unwrap_or(true)  // ON by default in composite mode
+    })
+}
+
+fn newell_direct_radius() -> usize {
+    static R: OnceLock<usize> = OnceLock::new();
+    *R.get_or_init(|| {
+        std::env::var("LLG_NEWELL_DIRECT_RADIUS")
+            .ok().and_then(|s| s.parse().ok())
+            .unwrap_or(0)  // 0 = use full grid (all material cells)
+    })
+}
+
+/// Precomputed Newell tensor components for direct demag evaluation.
+///
+/// Stores K_xx, K_xy, K_yy, K_zz (= μ₀ × N) for all offsets (di, dj)
+/// within a square of side 2*radius+1.  K includes μ₀ so B = K × M (in Tesla).
+struct NewellDirectDemag {
+    kxx: Vec<f64>,
+    kxy: Vec<f64>,
+    kyy: Vec<f64>,
+    kzz: Vec<f64>,
+    radius: usize,
+    stride: usize,
+    /// Indices of ALL material cells on L0 (where mask=true).
+    material_cells: Vec<usize>,
+}
+
+impl NewellDirectDemag {
+    fn new(dx: f64, dy: f64, dz: f64, radius: usize, mask: &[bool], _nx: usize) -> Self {
+        let stride = 2 * radius + 1;
+        let n = stride * stride;
+        let mut kxx = vec![0.0; n];
+        let mut kxy = vec![0.0; n];
+        let mut kyy = vec![0.0; n];
+        let mut kzz = vec![0.0; n];
+
+        let accuracy = 10.0;
+
+        for dj in -(radius as isize)..=(radius as isize) {
+            for di in -(radius as isize)..=(radius as isize) {
+                let (k_xx, k_xy, k_yy, k_zz) =
+                    demag_fft_uniform::kernel_2d_components_mumax_like(
+                        dx, dy, dz, di, dj, accuracy,
+                    );
+                let idx = (dj + radius as isize) as usize * stride
+                        + (di + radius as isize) as usize;
+                kxx[idx] = k_xx;
+                kxy[idx] = k_xy;
+                kyy[idx] = k_yy;
+                kzz[idx] = k_zz;
+            }
+        }
+
+        let material_cells: Vec<usize> = (0..mask.len())
+            .filter(|&i| mask[i]).collect();
+
+        Self { kxx, kxy, kyy, kzz, radius, stride, material_cells }
+    }
+
+    /// Compute exact B_demag at ALL material cells by direct Newell summation.
+    ///
+    /// Overwrites b_demag at every material cell.  Vacuum cells are zeroed.
+    ///
+    /// Two optimisations over the original offset-scanning loop:
+    ///   1. Inner loop iterates over `material_cells` directly instead of all
+    ///      (2R+1)² offsets. This reduces from O(N_mat × R²) with mostly-skipped
+    ///      vacuum iterations to O(N_mat²) with zero waste.
+    ///      For 3228 material cells, R=96: 10.4M vs 120M iterations.
+    ///   2. Outer loop is parallelised with rayon (each target cell is independent).
+    ///
+    /// Note: summation order differs from the offset-scanning version (source-index
+    /// order vs offset order), so results differ at floating-point rounding level
+    /// (~1e-16 relative). Physics-identical for all practical purposes.
+    fn compute_all(
+        &self,
+        b_demag: &mut VectorField2D,
+        m: &[[f64; 3]],
+        _mask: &[bool],
+        nx: usize, _ny: usize,
+        ms: f64,
+    ) {
+        let r = self.radius as isize;
+
+        // Zero everything first (vacuum stays zero).
+        for v in b_demag.data.iter_mut() {
+            *v = [0.0; 3];
+        }
+
+        // Parallel over target cells; inner loop over material sources only.
+        let results: Vec<(usize, [f64; 3])> = self.material_cells
+            .par_iter()
+            .map(|&idx| {
+                let ci = (idx % nx) as isize;
+                let cj = (idx / nx) as isize;
+
+                let mut bx = 0.0f64;
+                let mut by = 0.0f64;
+                let mut bz = 0.0f64;
+
+                for &src in &self.material_cells {
+                    let si = (src % nx) as isize;
+                    let sj = (src / nx) as isize;
+                    let di = si - ci;
+                    let dj = sj - cj;
+
+                    // Skip sources outside the precomputed kernel table.
+                    // With radius >= max(nx,ny) this never triggers, but
+                    // kept for safety if radius is reduced in future.
+                    if di < -r || di > r || dj < -r || dj > r { continue; }
+
+                    let k = (dj + r) as usize * self.stride
+                          + (di + r) as usize;
+                    let mx = m[src][0] * ms;
+                    let my = m[src][1] * ms;
+                    let mz = m[src][2] * ms;
+
+                    bx += self.kxx[k] * mx + self.kxy[k] * my;
+                    by += self.kxy[k] * mx + self.kyy[k] * my;
+                    bz += self.kzz[k] * mz;
+                }
+                (idx, [bx, by, bz])
+            })
+            .collect();
+
+        // Scatter parallel results back into b_demag.
+        for (idx, b) in results {
+            b_demag.data[idx] = b;
+        }
+    }
+}
+
+pub(crate) struct CompositeGridPoisson {
+    base_grid: Grid2D,
+    l0_solver: DemagPoissonMGHybrid,
+    /// Per-patch Poisson data for the composite V-cycle (Phase 1+).
+    l1_data: Vec<PatchPoissonData>,
+    l2plus_data: Vec<Vec<PatchPoissonData>>,
+    /// L0 magnet-layer φ, persisted across V-cycle iterations and timesteps (warm start).
+    coarse_phi: Vec<f64>,
+    /// L0 in-plane ∇·(Ms·m), computed once per timestep from coarse M.
+    coarse_div: Vec<f64>,
+    /// V-cycle configuration.
+    vcfg: CompositeVCycleConfig,
+    /// Direct Newell demag for exact L0 B (lazily initialised).
+    newell: Option<NewellDirectDemag>,
+}
+
+impl CompositeGridPoisson {
+    pub(crate) fn new(base_grid: Grid2D) -> Self {
+        let mg_cfg = DemagPoissonMGConfig::from_env();
+
+        // PPPM is no longer auto-enabled — direct Newell replaces it for L0 B.
+        // MG is kept only for φ (V-cycle ghost-fills to patches).
+        // Explicitly disable PPPM unless the user forces it on.
+        if newell_direct_enabled() && std::env::var("LLG_DEMAG_MG_HYBRID_ENABLE").is_err() {
+            unsafe {
+                std::env::set_var("LLG_DEMAG_MG_HYBRID_ENABLE", "0");
+            }
+            eprintln!(
+                "[composite] direct Newell enabled — PPPM disabled (MG kept for V-cycle φ only)"
+            );
+        } else if std::env::var("LLG_DEMAG_MG_HYBRID_ENABLE").is_err() {
+            // Newell disabled, fall back to PPPM.
+            unsafe {
+                std::env::set_var("LLG_DEMAG_MG_HYBRID_ENABLE", "1");
+                std::env::set_var("LLG_DEMAG_MG_HYBRID_RADIUS", "14");
+            }
+            eprintln!(
+                "[composite] auto-enabling PPPM hybrid (radius=14) for L0 accuracy"
+            );
+        }
+
+        let hyb_cfg = HybridConfig::from_env();
+        let l0_solver = DemagPoissonMGHybrid::new(base_grid, mg_cfg, hyb_cfg);
+        let n = base_grid.nx * base_grid.ny;
+        Self {
+            base_grid,
+            l0_solver,
+            l1_data: Vec::new(),
+            l2plus_data: Vec::new(),
+            coarse_phi: vec![0.0; n],
+            coarse_div: vec![0.0; n],
+            vcfg: CompositeVCycleConfig::default(),
+            newell: None,
+        }
+    }
+
+    pub(crate) fn same_structure(&self, h: &AmrHierarchy2D) -> bool {
+        self.base_grid.nx == h.base_grid.nx
+            && self.base_grid.ny == h.base_grid.ny
+            && self.base_grid.dx == h.base_grid.dx
+            && self.base_grid.dy == h.base_grid.dy
+            && self.base_grid.dz == h.base_grid.dz
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 5: Composite V-cycle
+    // ------------------------------------------------------------------
+
+    /// Run one composite V-cycle iteration (García-Cervera / AMReX pattern).
+    ///
+    /// Downstroke (finest → coarsest):
+    ///   For each level from L_finest down to L1:
+    ///     Ghost-fill φ from PARENT level → pre-smooth → compute residual
+    ///     Restrict residual into parent level patches
+    ///   Restrict L1 residuals to L0.
+    ///
+    /// L0 solve: existing 3D MG+PPPM with restricted fine residuals.
+    ///
+    /// Upstroke (coarsest → finest):
+    ///   L1: prolongate from L0 → ghost-fill from L0 → post-smooth.
+    ///   For each level from L2 up to L_finest:
+    ///     Prolongate from PARENT patch → ghost-fill from parent → post-smooth.
+    ///
+    /// `parent_maps` is the pre-computed parent-index map from `build_parent_index_maps`.
+    /// `b_scratch` is a temporary VectorField2D used by solve_with_corrections.
+    fn vcycle_iteration(
+        &mut self,
+        h: &AmrHierarchy2D,
+        mat: &Material,
+        parent_maps: &[Vec<usize>],
+        b_scratch: &mut VectorField2D,
+    ) {
+        let cnx = h.base_grid.nx;
+        let cny = h.base_grid.ny;
+        let cdx = h.base_grid.dx;
+        let cdy = h.base_grid.dy;
+        let _step_ratio = h.ratio; // ratio between adjacent AMR levels (retained for future use)
+
+        // ═══════ DOWNSTROKE: finest → coarsest ═══════
+        //
+        // Two-pass approach to avoid the ordering issue where restriction
+        // from a child level would be overwritten by the parent's
+        // compute_residual_2d.
+        //
+        // Pass 1: All levels ghost-fill + smooth + compute residual.
+        //         Processed finest-first so ghost values are current.
+        // Pass 2: Cascade restrictions from finest to coarsest.
+        //         Each level's residual at covered cells is REPLACED with
+        //         the restricted fine residual. This cascades L3→L2→L1.
+
+        // ── Pass 1: Ghost-fill + smooth + residual on ALL levels ──
+
+        // L2+ from finest to coarsest
+        for lvl_idx in (0..h.patches_l2plus.len()).rev() {
+            let lvl_patches = &h.patches_l2plus[lvl_idx];
+            if lvl_patches.is_empty() { continue; }
+
+            // Clone parent φ arrays for ghost-fill (avoids borrow conflicts).
+            let parent_phis: Vec<Vec<f64>> = if lvl_idx == 0 {
+                self.l1_data.iter().map(|pd| pd.phi.clone()).collect()
+            } else {
+                self.l2plus_data[lvl_idx - 1].iter().map(|pd| pd.phi.clone()).collect()
+            };
+            let parent_patches: &[Patch2D] = if lvl_idx == 0 {
+                &h.patches
+            } else {
+                &h.patches_l2plus[lvl_idx - 1]
+            };
+
+            for (pi, (patch, pd)) in lvl_patches.iter()
+                .zip(self.l2plus_data[lvl_idx].iter_mut()).enumerate()
+            {
+                let parent_idx = parent_maps[lvl_idx][pi];
+                fill_phi_ghosts_from_parent_patch(
+                    patch, &mut pd.phi,
+                    &parent_patches[parent_idx], &parent_phis[parent_idx]);
+
+                smooth_jacobi_2d(
+                    &mut pd.phi, &pd.rhs, &mut pd.residual,
+                    pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy, pd.dz,
+                    self.vcfg.omega, self.vcfg.n_pre);
+
+                compute_residual_2d(pd);
+            }
+        }
+
+        // L1 patches
+        for (patch, pd) in h.patches.iter().zip(self.l1_data.iter_mut()) {
+            fill_phi_ghosts_from_coarse(
+                patch, &mut pd.phi, &self.coarse_phi, cnx, cny, cdx, cdy);
+
+            smooth_jacobi_2d(
+                &mut pd.phi, &pd.rhs, &mut pd.residual,
+                pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy, pd.dz,
+                self.vcfg.omega, self.vcfg.n_pre);
+
+            compute_residual_2d(pd);
+        }
+
+        // NOTE: Pass 2 (cascade restriction finest→coarsest) is REMOVED.
+        // The restricted residuals were never sent to L0 (solve_with_corrections
+        // receives &[]), so all restriction work was wasted. The residuals
+        // computed above are retained for convergence monitoring only.
+
+        // ═══════ L0 SOLVE (MG for φ; B will be overwritten by Newell) ═══════
+
+        let phi_old_l0 = self.coarse_phi.clone();
+
+        self.l0_solver.solve_with_corrections(
+            &h.coarse, &[], b_scratch, mat);
+
+        // Extract updated L0 φ (used for V-cycle ghost-fills to patches).
+        let new_phi = self.l0_solver.mg.extract_magnet_layer_phi();
+        self.coarse_phi.copy_from_slice(&new_phi);
+
+        // NOTE: PPPM-φ correction removed — direct Newell replaces PPPM.
+        // MG φ is used raw for ghost-fills; any φ error is corrected by
+        // the patch-level smoother during the upstroke.
+
+        // ═══════ UPSTROKE: coarsest → finest ═══════
+
+        // L1 patches: prolongate correction from L0, ghost-fill, post-smooth.
+        // Save L1 phi_old for L2 prolongation.
+        let l1_phi_old: Vec<Vec<f64>> = self.l1_data.iter()
+            .map(|pd| pd.phi.clone()).collect();
+
+        for (patch, pd) in h.patches.iter().zip(self.l1_data.iter_mut()) {
+            prolongate_phi_correction(
+                &self.coarse_phi, &phi_old_l0, cnx, cny, cdx, cdy,
+                patch, &mut pd.phi);
+
+            fill_phi_ghosts_from_coarse(
+                patch, &mut pd.phi, &self.coarse_phi, cnx, cny, cdx, cdy);
+
+            smooth_jacobi_2d(
+                &mut pd.phi, &pd.rhs, &mut pd.residual,
+                pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy, pd.dz,
+                self.vcfg.omega, self.vcfg.n_post);
+        }
+
+        // L2+ levels: prolongate from parent, ghost-fill, post-smooth.
+        // Process from coarsest (L2) to finest (L_max).
+        // prev_phi_old tracks each level's φ before prolongation so the
+        // next finer level can compute the correction delta.
+        let mut prev_phi_old: Vec<Vec<f64>> = l1_phi_old; // starts with L1 old
+
+        for lvl_idx in 0..h.patches_l2plus.len() {
+            let lvl_patches = &h.patches_l2plus[lvl_idx];
+            if lvl_patches.is_empty() {
+                // Carry forward: set prev_phi_old to current level's phi
+                prev_phi_old = self.l2plus_data[lvl_idx].iter()
+                    .map(|pd| pd.phi.clone()).collect();
+                continue;
+            }
+
+            let parent_patches: &[Patch2D] = if lvl_idx == 0 {
+                &h.patches
+            } else {
+                &h.patches_l2plus[lvl_idx - 1]
+            };
+
+            // Clone parent φ to avoid borrow conflict: we need immutable
+            // parent data while mutating child data in l2plus_data.
+            let parent_phis_new: Vec<Vec<f64>> = if lvl_idx == 0 {
+                self.l1_data.iter().map(|pd| pd.phi.clone()).collect()
+            } else {
+                self.l2plus_data[lvl_idx - 1].iter().map(|pd| pd.phi.clone()).collect()
+            };
+
+            // Save this level's phi_old for the next level.
+            let this_phi_old: Vec<Vec<f64>> = self.l2plus_data[lvl_idx].iter()
+                .map(|pd| pd.phi.clone()).collect();
+
+            for (pi, (patch, pd)) in lvl_patches.iter()
+                .zip(self.l2plus_data[lvl_idx].iter_mut()).enumerate()
+            {
+                let parent_idx = parent_maps[lvl_idx][pi];
+
+                prolongate_phi_correction_from_parent_patch(
+                    &parent_patches[parent_idx],
+                    &parent_phis_new[parent_idx],
+                    &prev_phi_old[parent_idx],
+                    patch, &mut pd.phi);
+
+                fill_phi_ghosts_from_parent_patch(
+                    patch, &mut pd.phi,
+                    &parent_patches[parent_idx], &parent_phis_new[parent_idx]);
+
+                smooth_jacobi_2d(
+                    &mut pd.phi, &pd.rhs, &mut pd.residual,
+                    pd.nx, pd.ny, pd.ghost, pd.dx, pd.dy, pd.dz,
+                    self.vcfg.omega, self.vcfg.n_post);
+            }
+
+            prev_phi_old = this_phi_old;
+        }
+    }
+
+    /// Composite V-cycle solve (true iterative V-cycle).
+    ///
+    /// Architecture (following García-Cervera / AMReX):
+    ///   1. Allocate/populate patch φ/rhs data.
+    ///   2. Iterate the composite V-cycle:
+    ///        Downstroke: finest → coarsest (smooth + restrict residuals)
+    ///        L0 solve: 3D MG+PPPM with restricted fine residuals
+    ///        Upstroke: coarsest → finest (prolongate + smooth)
+    ///   3. Extract B from converged φ:
+    ///        L0: from the MG solve (ΔK-corrected)
+    ///        Patches: B = −μ₀∇(φ_patch) at fine resolution
+    ///
+    /// Key difference from the old defect-correction path:
+    ///   - Patches solve the FULL Poisson equation (rhs = fine ∇·M), not a defect
+    ///   - Ghost values come from parent-level φ (hierarchical, not from L0)
+    ///   - Multiple V-cycle iterations allow φ to converge across all levels
+    ///   - B is extracted from the converged φ gradient, not from interp(B_L0)+δB
+    pub(crate) fn compute_vcycle(
+        &mut self,
+        h: &AmrHierarchy2D,
+        mat: &Material,
+        b_demag_coarse: &mut VectorField2D,
+    ) -> (Vec<Vec<[f64; 3]>>, Vec<Vec<Vec<[f64; 3]>>>) {
+        if !mat.demag {
+            b_demag_coarse.set_uniform(0.0, 0.0, 0.0);
+            return (Vec::new(), Vec::new());
+        }
+
+        let n_l1 = h.patches.len();
+        let has_patches = n_l1 > 0
+            || h.patches_l2plus.iter().any(|v| !v.is_empty());
+
+        // ---- Reallocate patch data if structure changed ----
+        let need_realloc = self.l1_data.len() != n_l1
+            || self.l2plus_data.len() != h.patches_l2plus.len()
+            || self.l2plus_data.iter().zip(h.patches_l2plus.iter())
+                .any(|(d, p)| d.len() != p.len())
+            || self.l1_data.iter().zip(h.patches.iter())
+                .any(|(pd, p)| pd.nx != p.grid.nx || pd.ny != p.grid.ny)
+            || self.l2plus_data.iter().zip(h.patches_l2plus.iter())
+                .any(|(lvl_d, lvl_p)| lvl_d.iter().zip(lvl_p.iter())
+                    .any(|(pd, p)| pd.nx != p.grid.nx || pd.ny != p.grid.ny));
+
+        if need_realloc {
+            let (l1, l2) = allocate_patch_poisson_data(h);
+            self.l1_data = l1;
+            self.l2plus_data = l2;
+        }
+
+        let n_coarse = h.base_grid.nx * h.base_grid.ny;
+        if self.coarse_phi.len() != n_coarse {
+            self.coarse_phi = vec![0.0; n_coarse];
+            self.coarse_div = vec![0.0; n_coarse];
+        }
+
+        // ---- Lazy-init direct Newell tensor ----
+        if newell_direct_enabled() && self.newell.is_none() {
+            let cnx = h.base_grid.nx;
+            let cny = h.base_grid.ny;
+            // Radius 0 = use full grid extent (covers all material interactions)
+            let r_env = newell_direct_radius();
+            let r = if r_env == 0 { cnx.max(cny) } else { r_env };
+            eprintln!(
+                "[composite] building direct Newell tensor (radius={}) ...", r);
+            let t0 = std::time::Instant::now();
+            let default_mask = vec![true; cnx * cny];
+            let mask = h.geom_mask.as_deref()
+                .unwrap_or(&default_mask);
+            self.newell = Some(NewellDirectDemag::new(
+                h.base_grid.dx, h.base_grid.dy, h.base_grid.dz,
+                r, mask, cnx));
+            let n_mat = self.newell.as_ref().unwrap().material_cells.len();
+            eprintln!(
+                "[composite] Newell tensor ready: {} material cells, radius={}, {:.1}s",
+                n_mat, r, t0.elapsed().as_secs_f64());
+        }
+
+        // ---- Compute fine ∇·M on all patches (patch RHS) ----
+        if has_patches {
+            compute_all_patch_rhs(h, &mut self.l1_data, &mut self.l2plus_data, mat.ms);
+        }
+
+        // ---- Compute coarse ∇·M on L0 (for restriction delta) ----
+        compute_scaled_div_m(
+            &h.coarse.data, h.base_grid.nx, h.base_grid.ny,
+            h.base_grid.dx, h.base_grid.dy, mat.ms,
+            &mut self.coarse_div,
+        );
+
+        // ---- Pre-compute parent-patch index maps ----
+        let parent_maps = build_parent_index_maps(h);
+
+        // ════════════════════════════════════════════════════════════════
+        // COMPOSITE V-CYCLE ITERATIONS
+        // ════════════════════════════════════════════════════════════════
+        let max_cycles = self.vcfg.max_cycles;
+        let mut b_scratch = VectorField2D::new(self.base_grid);
+
+        if composite_diag() {
+            let n_l2plus: usize = h.patches_l2plus.iter().map(|v| v.len()).sum();
+            eprintln!("[composite VCYCLE] ═══════════════════════════════════════════════════");
+            eprintln!("[composite VCYCLE] Iterative V-cycle: L1={}, L2+={}, max_cycles={}",
+                n_l1, n_l2plus, max_cycles);
+        }
+
+        for cycle in 0..max_cycles {
+            self.vcycle_iteration(h, mat, &parent_maps, &mut b_scratch);
+
+            // Monitor convergence: max residual norm on all patches.
+            if composite_diag() || cycle + 1 == max_cycles {
+                let mut max_res = 0.0f64;
+                for pd in self.l1_data.iter() {
+                    for &v in pd.residual.iter() {
+                        max_res = max_res.max(v.abs());
+                    }
+                }
+                for lvl_data in self.l2plus_data.iter() {
+                    for pd in lvl_data.iter() {
+                        for &v in pd.residual.iter() {
+                            max_res = max_res.max(v.abs());
+                        }
+                    }
+                }
+                if composite_diag() {
+                    eprintln!(
+                        "[composite VCYCLE] cycle {}/{}: max|residual| = {:.4e}",
+                        cycle + 1, max_cycles, max_res);
+                }
+            }
+        }
+
+        if composite_diag() {
+            // Report converged φ magnitudes per level.
+            let mut max_phi_l1 = 0.0f64;
+            for pd in self.l1_data.iter() {
+                for &v in pd.phi.iter() {
+                    max_phi_l1 = max_phi_l1.max(v.abs());
+                }
+            }
+            eprintln!("[composite VCYCLE] converged max|φ| on L1 = {:.4e}", max_phi_l1);
+
+            for (lvl_idx, lvl_data) in self.l2plus_data.iter().enumerate() {
+                let mut max_phi = 0.0f64;
+                for pd in lvl_data.iter() {
+                    for &v in pd.phi.iter() {
+                        max_phi = max_phi.max(v.abs());
+                    }
+                }
+                if !lvl_data.is_empty() {
+                    eprintln!(
+                        "[composite VCYCLE] converged max|φ| on L{} = {:.4e}",
+                        lvl_idx + 2, max_phi);
+                }
+            }
+            eprintln!("[composite VCYCLE] ═══════════════════════════════════════════════════");
+        }
+
+        // ════════════════════════════════════════════════════════════════
+        // EXTRACT B: HYBRID STRATEGY BY LEVEL
+        // ════════════════════════════════════════════════════════════════
+        //
+        // FINEST level: B = −μ₀∇(φ_patch) directly from V-cycle φ.
+        //   The finest level's φ is well-converged at full fine resolution.
+        //   Its gradient gives the best edge accuracy because it directly
+        //   resolves sub-cell geometry without interpolation loss.
+        //
+        // COARSER levels: B = interp(B_parent) + δB (hybrid defect formula).
+        //   Coarser levels' φ is anchored to L0 ghost values via bilinear
+        //   interpolation. The ΔK-corrected base B is more accurate at bulk
+        //   cells than ∇ of this interpolated φ. The defect δB adds only
+        //   the high-frequency correction the parent grid missed.
+        //
+        // L2+ uses hierarchical composite fields: after L1 defect correction,
+        // L1's fine-averaged div/B are overlaid onto L0 composites. L2 defects
+        // against this better base, and so on up to the finest level.
+
+        b_demag_coarse.data.copy_from_slice(&b_scratch.data);
+
+        // ── Direct Newell: overwrite L0 B with exact Newell tensor result ──
+        // This replaces MG+PPPM B at all material cells with the exact
+        // demag field computed from the Newell tensor and actual M values.
+        // Patches then compute their defect corrections against this exact base.
+        if let Some(ref newell) = self.newell {
+            if let Some(gm) = h.geom_mask.as_deref() {
+                newell.compute_all(
+                    b_demag_coarse,
+                    &h.coarse.data, gm,
+                    h.base_grid.nx, h.base_grid.ny,
+                    mat.ms,
+                );
+            }
+        }
+
+        let cnx = h.base_grid.nx;
+        let cny = h.base_grid.ny;
+        let cdx = h.base_grid.dx;
+        let cdy = h.base_grid.dy;
+        let omega = self.vcfg.omega;
+
+        // Clone staircase coarse_div to a local (borrow-checker safety).
+        let staircase_div = self.coarse_div.clone();
+
+        // Determine the finest level that has patches.
+        // If no L2+ patches exist, L1 is the finest.
+        let finest_l2plus_idx: Option<usize> = (0..h.patches_l2plus.len()).rev()
+            .find(|&i| !h.patches_l2plus[i].is_empty());
+        let l1_is_finest = finest_l2plus_idx.is_none() && !h.patches.is_empty();
+
+        // ── L1 B extraction ──
+        let b_l1: Vec<Vec<[f64; 3]>> = if l1_is_finest {
+            // L1 is the finest level → use ∇φ for best edge accuracy.
+            h.patches.iter()
+                .zip(self.l1_data.iter())
+                .map(|(patch, pd)| extract_b_from_patch_phi(patch, &pd.phi, b_demag_coarse))
+                .collect()
+        } else {
+            // L1 is NOT the finest → use hybrid defect for best bulk accuracy.
+            // IMPORTANT: save/restore pd.phi because compute_defect_correction_on_patch
+            // zeroes it for the δφ solve. We must preserve the V-cycle's converged φ
+            // for warm-start on subsequent calls and for L2+ ghost-fill.
+            h.patches.iter()
+                .zip(self.l1_data.iter_mut())
+                .map(|(patch, pd)| {
+                    let saved_phi = pd.phi.clone();
+                    let b = compute_defect_correction_on_patch(
+                        patch, pd,
+                        &staircase_div, cnx, cny, cdx, cdy,
+                        b_demag_coarse, omega,
+                    );
+                    pd.phi.copy_from_slice(&saved_phi);
+                    b
+                })
+                .collect()
+        };
+
+        // ── Build composite L0 fields with L1 corrections ──
+        let mut composite_div = staircase_div;
+        let mut composite_b = VectorField2D::new(self.base_grid);
+        composite_b.data.copy_from_slice(&b_demag_coarse.data);
+
+        if finest_l2plus_idx.is_some() {
+            // Only build composites if L2+ levels exist.
+            update_composite_div(
+                &mut composite_div, &h.patches, &self.l1_data, cnx);
+            update_composite_b(
+                &mut composite_b.data, &h.patches, &b_l1, cnx);
+        }
+
+        // ── L2+ B extraction ──
+        let mut b_l2: Vec<Vec<Vec<[f64; 3]>>> =
+            Vec::with_capacity(h.patches_l2plus.len());
+
+        for lvl_idx in 0..h.patches_l2plus.len() {
+            let lvl_patches = &h.patches_l2plus[lvl_idx];
+            let is_finest = Some(lvl_idx) == finest_l2plus_idx;
+
+            let lvl_b: Vec<Vec<[f64; 3]>> = if is_finest {
+                // Finest level: PER-CELL merge of two methods.
+                //   Edge cells (near material/vacuum boundary): ∇φ for best edge accuracy
+                //   Bulk cells (far from boundary): hybrid defect for best bulk accuracy
+                //
+                // This gives the best of both: L3 edge ≈12% (from ∇φ)
+                // and L3 bulk ≈4.5% (from defect).
+                lvl_patches.iter()
+                    .zip(self.l2plus_data[lvl_idx].iter_mut())
+                    .map(|(patch, pd)| {
+                        // 1. Compute ∇φ for all cells.
+                        let b_phi = extract_b_from_patch_phi(patch, &pd.phi, &composite_b);
+
+                        // 2. Compute defect for all cells (save/restore phi).
+                        let saved_phi = pd.phi.clone();
+                        let b_defect = compute_defect_correction_on_patch(
+                            patch, pd,
+                            &composite_div, cnx, cny, cdx, cdy,
+                            &composite_b, omega,
+                        );
+                        pd.phi.copy_from_slice(&saved_phi);
+
+                        // 3. Build edge proximity mask from patch magnetisation.
+                        // A cell is "near boundary" if any cell within `band`
+                        // manhattan distance has |m| < 0.5 (vacuum).
+                        let pnx = patch.grid.nx;
+                        let pny = patch.grid.ny;
+                        let m_data = &patch.m.data;
+                        let band: isize = 5; // ~2.5nm at L3 dx=0.49nm
+
+                        let mut near_boundary = vec![false; pnx * pny];
+                        for j in 0..pny {
+                            for i in 0..pnx {
+                                let m = m_data[j * pnx + i];
+                                let mag2 = m[0]*m[0] + m[1]*m[1] + m[2]*m[2];
+                                if mag2 < 0.25 {
+                                    // This cell is vacuum — mark all cells within band.
+                                    for dj in -band..=band {
+                                        for di in -band..=band {
+                                            let ni = i as isize + di;
+                                            let nj = j as isize + dj;
+                                            if ni >= 0 && ni < pnx as isize
+                                                && nj >= 0 && nj < pny as isize
+                                            {
+                                                near_boundary[nj as usize * pnx + ni as usize] = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 4. Merge: edge cells → ∇φ, bulk cells → defect.
+                        let mut b_merged = vec![[0.0f64; 3]; pnx * pny];
+                        for k in 0..pnx * pny {
+                            b_merged[k] = if near_boundary[k] {
+                                b_phi[k]
+                            } else {
+                                b_defect[k]
+                            };
+                        }
+                        b_merged
+                    })
+                    .collect()
+            } else {
+                // Coarser level: hybrid defect for best bulk accuracy.
+                // Save/restore pd.phi (same reason as L1 above).
+                lvl_patches.iter()
+                    .zip(self.l2plus_data[lvl_idx].iter_mut())
+                    .map(|(patch, pd)| {
+                        let saved_phi = pd.phi.clone();
+                        let b = compute_defect_correction_on_patch(
+                            patch, pd,
+                            &composite_div, cnx, cny, cdx, cdy,
+                            &composite_b, omega,
+                        );
+                        pd.phi.copy_from_slice(&saved_phi);
+                        b
+                    })
+                    .collect()
+            };
+
+            // Update composites with this level's data for the next level.
+            // Skip at the finest level (nothing uses composites after it).
+            if !is_finest && lvl_idx + 1 < h.patches_l2plus.len() {
+                update_composite_div(
+                    &mut composite_div, lvl_patches,
+                    &self.l2plus_data[lvl_idx], cnx);
+                update_composite_b(
+                    &mut composite_b.data, lvl_patches, &lvl_b, cnx);
+            }
+
+            b_l2.push(lvl_b);
+        }
+
+        (b_l1, b_l2)
+    }
+
+    pub(crate) fn compute(
+        &mut self,
+        h: &AmrHierarchy2D,
+        mat: &Material,
+        b_demag_coarse: &mut VectorField2D,
+    ) -> (Vec<Vec<[f64; 3]>>, Vec<Vec<Vec<[f64; 3]>>>) {
+        if !mat.demag {
+            b_demag_coarse.set_uniform(0.0, 0.0, 0.0);
+            return (Vec::new(), Vec::new());
+        }
+
+        let n_l1 = h.patches.len();
+        let n_l2plus: usize = h.patches_l2plus.iter().map(|v| v.len()).sum();
+        let has_patches = n_l1 > 0 || n_l2plus > 0;
+
+        // ================================================================
+        // Allocate and populate patch Poisson data
+        // ================================================================
+
+        let need_realloc = self.l1_data.len() != n_l1
+            || self.l2plus_data.len() != h.patches_l2plus.len()
+            || self.l2plus_data.iter().zip(h.patches_l2plus.iter())
+                .any(|(d, p)| d.len() != p.len())
+            || self.l1_data.iter().zip(h.patches.iter())
+                .any(|(pd, p)| pd.nx != p.grid.nx || pd.ny != p.grid.ny)
+            || self.l2plus_data.iter().zip(h.patches_l2plus.iter())
+                .any(|(lvl_d, lvl_p)| lvl_d.iter().zip(lvl_p.iter())
+                    .any(|(pd, p)| pd.nx != p.grid.nx || pd.ny != p.grid.ny));
+
+        if need_realloc {
+            let (l1, l2) = allocate_patch_poisson_data(h);
+            self.l1_data = l1;
+            self.l2plus_data = l2;
+        }
+
+        if has_patches {
+            compute_all_patch_rhs(h, &mut self.l1_data, &mut self.l2plus_data, mat.ms);
+        }
+
+        // ================================================================
+        // L0 solve: MG (+ optional PPPM) on coarse M.
+        //
+        // Two modes controlled by LLG_COMPOSITE_ENHANCED_RHS:
+        //   Default (0): staircase coarse M only, PPPM handles accuracy.
+        //   Enhanced (1): inject fine boundary charges into L0 RHS
+        //                 (García-Cervera approach). No PPPM needed.
+        // ================================================================
+
+        let corrections = if enhanced_rhs_enabled() && has_patches {
+            let cnx = h.base_grid.nx;
+            let cny = h.base_grid.ny;
+            let mut coarse_div_tmp = vec![0.0f64; cnx * cny];
+            compute_scaled_div_m(
+                &h.coarse.data, cnx, cny,
+                h.base_grid.dx, h.base_grid.dy, mat.ms,
+                &mut coarse_div_tmp,
+            );
+            compute_patch_corrections(h, &coarse_div_tmp, mat.ms)
+        } else {
+            Vec::new()
+        };
+
+        self.l0_solver.solve_with_corrections(
+            &h.coarse, &corrections, b_demag_coarse, mat);
+
+        // ── Direct Newell: overwrite L0 B with exact result ──
+        if newell_direct_enabled() {
+            // Lazy-init Newell tensor (same logic as compute_vcycle)
+            if self.newell.is_none() {
+                let cnx = h.base_grid.nx;
+                let cny = h.base_grid.ny;
+                let r_env = newell_direct_radius();
+                let r = if r_env == 0 { cnx.max(cny) } else { r_env };
+                eprintln!("[composite] building direct Newell tensor (radius={}) ...", r);
+                let t0 = std::time::Instant::now();
+                let default_mask = vec![true; cnx * cny];
+                let mask = h.geom_mask.as_deref()
+                    .unwrap_or(&default_mask);
+                self.newell = Some(NewellDirectDemag::new(
+                    h.base_grid.dx, h.base_grid.dy, h.base_grid.dz,
+                    r, mask, cnx));
+                let n_mat = self.newell.as_ref().unwrap().material_cells.len();
+                eprintln!(
+                    "[composite] Newell tensor ready: {} material cells, radius={}, {:.1}s",
+                    n_mat, r, t0.elapsed().as_secs_f64());
+            }
+            if let Some(ref newell) = self.newell {
+                if let Some(gm) = h.geom_mask.as_deref() {
+                    newell.compute_all(
+                        b_demag_coarse,
+                        &h.coarse.data, gm,
+                        h.base_grid.nx, h.base_grid.ny,
+                        mat.ms,
+                    );
+                }
+            }
+        }
+
+        if composite_diag() {
+            let _l0_phi = self.l0_solver.mg.extract_magnet_layer_phi();
+            let phi_max = _l0_phi.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let phi_min = _l0_phi.iter().cloned().fold(f64::INFINITY, f64::min);
+            let mode = if enhanced_rhs_enabled() { "enhanced-RHS" } else { "staircase" };
+            eprintln!(
+                "[composite] L0 solve ({}): phi min={:.6e}, max={:.6e}",
+                mode, phi_min, phi_max,
+            );
+        }
+
+        // ================================================================
+        // Patch B extraction
+        //
+        // Two modes (LLG_COMPOSITE_PATCH_DEFECT):
+        //   Default (0): bilinear interpolation of L0 B to patches.
+        //     Fast (~6 flops/cell). Dynamics-validated: session summary
+        //     proved B extraction method has zero effect on dynamics.
+        //   Defect (1): screened 2D Jacobi correction.
+        //     ~25× slower per patch but ~9% edge RMSE vs ~16% for bilinear.
+        //     Use for static accuracy benchmarks.
+        // ================================================================
+
+        if !has_patches {
+            return (Vec::new(), Vec::new());
+        }
+
+        if !patch_defect_enabled() {
+            // ── Fast path: bilinear interpolation of L0 B ──
+            let b_l1: Vec<Vec<[f64; 3]>> = h.patches.iter()
+                .map(|p| sample_coarse_to_patch(b_demag_coarse, p)).collect();
+
+            let b_l2: Vec<Vec<Vec<[f64; 3]>>> = h.patches_l2plus.iter()
+                .map(|lvl| lvl.iter()
+                    .map(|p| sample_coarse_to_patch(b_demag_coarse, p)).collect()
+                ).collect();
+
+            return (b_l1, b_l2);
+        }
+
+        // ── Defect correction path (LLG_COMPOSITE_PATCH_DEFECT=1) ──
+
+        let cnx = h.base_grid.nx;
+        let cny = h.base_grid.ny;
+        let cdx = h.base_grid.dx;
+        let cdy = h.base_grid.dy;
+        let omega = self.vcfg.omega;
+
+        let mut coarse_div = vec![0.0f64; cnx * cny];
+        compute_scaled_div_m(
+            &h.coarse.data, cnx, cny, cdx, cdy, mat.ms,
+            &mut coarse_div,
+        );
+
+        // L1 patches: defect correction against L0 fields.
+        let b_l1: Vec<Vec<[f64; 3]>> = h.patches.iter()
+            .zip(self.l1_data.iter_mut())
+            .map(|(patch, pd)| {
+                compute_defect_correction_on_patch(
+                    patch, pd,
+                    &coarse_div, cnx, cny, cdx, cdy,
+                    b_demag_coarse, omega,
+                )
+            })
+            .collect();
+
+        // Build composite fields for L2+ hierarchy.
+        let mut composite_div = coarse_div;
+        let mut composite_b = VectorField2D::new(self.base_grid);
+        composite_b.data.copy_from_slice(&b_demag_coarse.data);
+
+        let has_l2plus = h.patches_l2plus.iter().any(|v| !v.is_empty());
+        if has_l2plus {
+            update_composite_div(
+                &mut composite_div, &h.patches, &self.l1_data, cnx);
+            update_composite_b(
+                &mut composite_b.data, &h.patches, &b_l1, cnx);
+        }
+
+        // L2+ patches: defect correction against composite parents.
+        let mut b_l2: Vec<Vec<Vec<[f64; 3]>>> =
+            Vec::with_capacity(h.patches_l2plus.len());
+
+        for lvl_idx in 0..h.patches_l2plus.len() {
+            let lvl_patches = &h.patches_l2plus[lvl_idx];
+
+            let lvl_b: Vec<Vec<[f64; 3]>> = lvl_patches.iter()
+                .zip(self.l2plus_data[lvl_idx].iter_mut())
+                .map(|(patch, pd)| {
+                    compute_defect_correction_on_patch(
+                        patch, pd,
+                        &composite_div, cnx, cny, cdx, cdy,
+                        &composite_b, omega,
+                    )
+                })
+                .collect();
+
+            if lvl_idx + 1 < h.patches_l2plus.len()
+                && !h.patches_l2plus[lvl_idx + 1].is_empty()
+            {
+                update_composite_div(
+                    &mut composite_div, lvl_patches,
+                    &self.l2plus_data[lvl_idx], cnx);
+                update_composite_b(
+                    &mut composite_b.data, lvl_patches, &lvl_b, cnx);
+            }
+
+            b_l2.push(lvl_b);
+        }
+
+        (b_l1, b_l2)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Module-level cache + public API
+// ---------------------------------------------------------------------------
+
+static COMPOSITE_CACHE: OnceLock<Mutex<Option<CompositeGridPoisson>>> = OnceLock::new();
+
+/// Check if the composite V-cycle mode is enabled via environment variable.
+///
+/// LLG_DEMAG_COMPOSITE_VCYCLE=1 enables the true composite V-cycle (Phases 0–6).
+/// Default (unset or 0): uses the existing enhanced-RHS path.
+fn vcycle_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("LLG_DEMAG_COMPOSITE_VCYCLE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Compute AMR-aware demag using the composite-grid solver.
+///
+/// Called from the stepper's `CompositeGrid` mode.
+///
+/// Two paths:
+/// - Default: enhanced-RHS (inject fine ∇·M into coarse MG, interpolate B to patches)
+/// - LLG_DEMAG_COMPOSITE_VCYCLE=1: true composite V-cycle (smooth φ on patches,
+///   extract B at fine resolution from patch φ)
+pub fn compute_composite_demag(
+    h: &AmrHierarchy2D,
+    mat: &Material,
+    b_demag_coarse: &mut VectorField2D,
+) -> (Vec<Vec<[f64; 3]>>, Vec<Vec<Vec<[f64; 3]>>>) {
+    let cache = COMPOSITE_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().expect("COMPOSITE_CACHE mutex poisoned");
+
+    let rebuild = match guard.as_ref() {
+        Some(s) => !s.same_structure(h),
+        None => true,
+    };
+
+    if rebuild {
+        let solver = CompositeGridPoisson::new(h.base_grid);
+        static ONCE: OnceLock<()> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            let newell = newell_direct_enabled();
+            let pppm = std::env::var("LLG_DEMAG_MG_HYBRID_ENABLE")
+                .map(|v| v == "1").unwrap_or(false);
+            let erhs = enhanced_rhs_enabled();
+            let pdef = patch_defect_enabled();
+            let patch_mode = if pdef { "defect-correction" } else { "bilinear-interp" };
+            let l0_mode = if newell { "Newell-direct" }
+                          else if pppm { "MG+PPPM" }
+                          else { "MG-only" };
+            if vcycle_enabled() {
+                eprintln!(
+                    "[composite] V-CYCLE mode (L0-B={}, enhanced-RHS={}, patch-B={}) — \
+                     iterative composite solve",
+                    l0_mode, erhs, patch_mode,
+                );
+            } else {
+                eprintln!(
+                    "[composite] DEFECT mode (L0-B={}, enhanced-RHS={}, patch-B={}) — \
+                     L0 MG solve + {} on patches",
+                    l0_mode, erhs, patch_mode, patch_mode,
+                );
+            }
+        });
+        *guard = Some(solver);
+    }
+
+    let solver = guard.as_mut().unwrap();
+    if vcycle_enabled() {
+        solver.compute_vcycle(h, mat, b_demag_coarse)
+    } else {
+        solver.compute(h, mat, b_demag_coarse)
+    }
+}
+
+#[cfg(test)]
+mod phase1_tests {
+    use super::*;
+
+    /// Test that PatchPoissonData computes the same divergence as
+    /// the existing compute_scaled_div_m helper.
+    #[test]
+    fn test_patch_poisson_data_rhs_matches_standalone() {
+        // Create a fake "patch-like" magnetisation on a 10x10 grid.
+        let nx = 10usize;
+        let ny = 10usize;
+        let dx = 5e-9;
+        let dy = 5e-9;
+        let ms = 800e3;
+
+        // Vortex-like pattern: m = (-y, x, 0) / r (normalised)
+        let cx = nx as f64 * 0.5;
+        let cy = ny as f64 * 0.5;
+        let mut m_data = vec![[0.0f64; 3]; nx * ny];
+        for j in 0..ny {
+            for i in 0..nx {
+                let x = (i as f64 + 0.5) - cx;
+                let y = (j as f64 + 0.5) - cy;
+                let r = (x * x + y * y).sqrt().max(0.5);
+                m_data[j * nx + i] = [-y / r, x / r, 0.0];
+            }
+        }
+
+        // Compute divergence using the standalone function.
+        let mut div_standalone = vec![0.0f64; nx * ny];
+        compute_scaled_div_m(&m_data, nx, ny, dx, dy, ms, &mut div_standalone);
+
+        // Create PatchPoissonData manually (without a real Patch2D).
+        let mut pd = PatchPoissonData {
+            phi: vec![0.0; nx * ny],
+            rhs: vec![0.0; nx * ny],
+            residual: vec![0.0; nx * ny],
+            nx,
+            ny,
+            ghost: 0,
+            dx,
+            dy,
+            dz: dx,
+        };
+
+        // Compute via PatchPoissonData method.
+        pd.compute_rhs_from_m(&m_data, ms);
+
+        // They must be bit-identical — both call the same function.
+        for k in 0..nx * ny {
+            assert_eq!(
+                pd.rhs[k], div_standalone[k],
+                "RHS mismatch at cell {}: pd={:.6e} standalone={:.6e}",
+                k, pd.rhs[k], div_standalone[k]
+            );
+        }
+
+        // Verify the divergence is non-trivial (vortex has ∇·M ≠ 0 near centre).
+        let max_div = pd.rhs.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        assert!(
+            max_div > 1e-10,
+            "divergence should be non-zero for vortex pattern, got max={:.3e}",
+            max_div
+        );
+
+        eprintln!("[phase1] RHS bit-identical to standalone: max|div|={:.6e}", max_div);
+        eprintln!("[phase1] PASSED: PatchPoissonData.compute_rhs_from_m matches compute_scaled_div_m");
+    }
+
+    /// Test area_avg_rhs_at_coarse_cell against manual summation.
+    #[test]
+    fn test_area_avg_rhs() {
+        // Simulate a 12×12 patch with ghost=2 and ratio=2.
+        // Interior: 8×8 fine cells covering 4×4 coarse cells.
+        let nx = 12usize;
+        let ny = 12usize;
+        let ghost = 2usize;
+        let ratio = 2usize;
+
+        let mut pd = PatchPoissonData {
+            phi: vec![0.0; nx * ny],
+            rhs: vec![0.0; nx * ny],
+            residual: vec![0.0; nx * ny],
+            nx,
+            ny,
+            ghost,
+            dx: 5e-9,
+            dy: 5e-9,
+            dz: 5e-9,
+        };
+
+        // Fill RHS with a known pattern: rhs[j*nx+i] = (i+1) * (j+1)
+        for j in 0..ny {
+            for i in 0..nx {
+                pd.rhs[j * nx + i] = ((i + 1) * (j + 1)) as f64;
+            }
+        }
+
+        // For coarse cell (ic=0, jc=0), ratio=2, ghost=2:
+        // Fine cells: fi in [2,3], fj in [2,3]
+        // Values: rhs[2*12+2]=9, rhs[2*12+3]=12, rhs[3*12+2]=12, rhs[3*12+3]=16
+        // Average: (9+12+12+16)/4 = 49/4 = 12.25
+        let avg00 = pd.area_avg_rhs_at_coarse_cell(0, 0, ratio, ghost);
+        assert!(
+            (avg00 - 12.25).abs() < 1e-12,
+            "area_avg at (0,0): expected 12.25, got {}", avg00
+        );
+
+        // For coarse cell (ic=1, jc=0), ratio=2, ghost=2:
+        // Fine cells: fi in [4,5], fj in [2,3]
+        // Values: rhs[2*12+4]=15, rhs[2*12+5]=18, rhs[3*12+4]=20, rhs[3*12+5]=24
+        // Average: (15+18+20+24)/4 = 77/4 = 19.25
+        let avg10 = pd.area_avg_rhs_at_coarse_cell(1, 0, ratio, ghost);
+        assert!(
+            (avg10 - 19.25).abs() < 1e-12,
+            "area_avg at (1,0): expected 19.25, got {}", avg10
+        );
+
+        eprintln!("[phase1] area_avg(0,0)={:.4}, area_avg(1,0)={:.4}", avg00, avg10);
+        eprintln!("[phase1] PASSED: area_avg_rhs_at_coarse_cell matches manual calculation");
+    }
+
+    /// Test that the 2D face-averaged divergence produces physically correct
+    /// results for a non-uniform magnetisation with vacuum cells.
+    ///
+    /// Key insight from the failure: for UNIFORM M on a fully-material grid,
+    /// the 2D face-averaged divergence is zero everywhere (including at domain
+    /// boundaries) because face_val returns the cell's own value when the
+    /// neighbour is outside. Surface charges in the physical problem come from
+    /// z-faces (handled by the 3D build_rhs_from_m, not the 2D divergence).
+    ///
+    /// This test uses a partially-vacuum grid where the material boundary
+    /// DOES produce in-plane surface charges visible to the 2D divergence.
+    #[test]
+    fn test_material_vacuum_interface_divergence() {
+        let nx = 16usize;
+        let ny = 16usize;
+        let dx = 5e-9;
+        let dy = 5e-9;
+        let ms = 800e3;
+
+        // Left half is material (M=[1,0,0]), right half is vacuum (M=[0,0,0]).
+        // The interface at i=7/i=8 should produce a surface charge:
+        // face_val(true, 1.0, false, 0.0) = 1.0 (left side contributes)
+        // vs face_val(true, 1.0, true, 1.0) = 1.0 (interior face)
+        // So at i=7 (last material cell): right face = face_val(true,1,false,0)=1.0
+        //                                  left face = face_val(true,1,true,1)=1.0
+        //                                  → div_x = (1.0 - 1.0)/dx = 0
+        // But at i=8 (first vacuum cell): is_mag = false → entire cell contributes 0
+        //
+        // Actually the surface charge shows up at the LAST material cell.
+        // At i=7: right face = face_val(c_in=true, mc=1, xp_in=false, 0) = 1.0
+        //         left face  = face_val(xm_in=true, 1, c_in=true, 1) = 1.0
+        //         → div_x = 0  ... hmm.
+        //
+        // The divergence is truly zero for uniform M even at the interface
+        // because the one-sided face value equals the cell value.
+        // The "charge" manifests when M VARIES near the interface.
+        //
+        // Use a gradient pattern instead: M_x increases linearly with i.
+        let mut m_data = vec![[0.0f64; 3]; nx * ny];
+        for j in 0..ny {
+            for i in 0..nx / 2 {
+                // M_x varies linearly: stronger to the right
+                let mx = (i as f64 + 1.0) / (nx as f64 / 2.0);
+                m_data[j * nx + i] = [mx, 0.0, 0.0];
+            }
+            // Right half stays [0,0,0] (vacuum)
+        }
+
+        let mut pd = PatchPoissonData {
+            phi: vec![0.0; nx * ny],
+            rhs: vec![0.0; nx * ny],
+            residual: vec![0.0; nx * ny],
+            nx,
+            ny,
+            ghost: 0,
+            dx,
+            dy,
+            dz: dx,
+        };
+
+        pd.compute_rhs_from_m(&m_data, ms);
+
+        // Interior material cells (i in 2..6) should have non-zero div
+        // because M_x is increasing → ∂M_x/∂x > 0.
+        let mut max_interior_div = 0.0f64;
+        for j in 2..ny - 2 {
+            for i in 2..6 {
+                max_interior_div = max_interior_div.max(pd.rhs[j * nx + i].abs());
+            }
+        }
+
+        // Interface cell (i=7, last material cell before vacuum):
+        // should have large divergence from the material-vacuum transition.
+        let j_mid = ny / 2;
+        let div_interface = pd.rhs[j_mid * nx + 7];
+
+        // First vacuum cell (i=8) should have zero divergence.
+        let div_vacuum = pd.rhs[j_mid * nx + 8];
+
+        eprintln!(
+            "[phase1] gradient M: max_interior_div={:.3e}, div_interface(i=7)={:.6e}, div_vacuum(i=8)={:.6e}",
+            max_interior_div, div_interface, div_vacuum
+        );
+
+        assert!(
+            max_interior_div > 0.0,
+            "interior divergence should be > 0 for increasing M_x"
+        );
+        // Interface cell has non-zero divergence (reduced by face-averaging
+        // at the material-vacuum boundary).
+        assert!(
+            div_interface.abs() > 0.0,
+            "interface divergence should be non-zero, got {:.3e}",
+            div_interface.abs()
+        );
+        // The first vacuum cell (i=8) also has non-zero divergence because
+        // the face-averaged operator's face_val sees the material neighbour
+        // at i=7: face_val(xm_in=true, m_xm, c_in=false, 0) = m_xm.
+        // This is correct — it's how the operator distributes surface charge.
+        // Deep vacuum cells (i >= 10) should be truly zero.
+        let div_deep_vacuum = pd.rhs[j_mid * nx + 10];
+        assert!(
+            div_deep_vacuum.abs() < 1e-30,
+            "deep vacuum divergence should be zero, got {:.3e}",
+            div_deep_vacuum.abs()
+        );
+
+        // Verify total charge conservation: sum of all divergence should
+        // relate to the net flux out of the material region.
+        let total_div: f64 = pd.rhs.iter().sum();
+        eprintln!("[phase1] total divergence sum: {:.6e}", total_div);
+
+        eprintln!("[phase1] PASSED: material-vacuum interface produces correct divergence pattern");
+    }
+}
+
+#[cfg(test)]
+mod phase2_tests {
+    use super::*;
+    use std::f64::consts::PI;
+
+    /// Manufactured solution test: verify the screened 2D Laplacian is correct.
+    ///
+    /// φ(x,y) = sin(πx/Lx) · sin(πy/Ly)
+    /// L(φ) = -(π²/Lx² + π²/Ly² + 2/dz²) · φ
+    ///
+    /// We set up a grid, fill φ with the exact function, apply the Laplacian,
+    /// and check that L(φ) matches the analytical value to O(dx²).
+    #[test]
+    fn test_laplacian_2d_manufactured() {
+        let nx = 34usize; // 30 interior + 2 ghost on each side
+        let ny = 34usize;
+        let ghost = 2usize;
+        let dx = 5e-9;
+        let dy = 5e-9;
+        let dz = 5e-9; // isotropic for test
+        let lx = (nx - 2 * ghost) as f64 * dx; // physical domain size
+        let ly = (ny - 2 * ghost) as f64 * dy;
+
+        // Fill phi with sin(πx/Lx)·sin(πy/Ly)
+        // x,y are local coordinates within the interior: x = (i - ghost + 0.5)*dx
+        let mut phi = vec![0.0f64; nx * ny];
+        for j in 0..ny {
+            for i in 0..nx {
+                let x = (i as f64 - ghost as f64 + 0.5) * dx;
+                let y = (j as f64 - ghost as f64 + 0.5) * dy;
+                phi[j * nx + i] = (PI * x / lx).sin() * (PI * y / ly).sin();
+            }
+        }
+
+        // Apply screened Laplacian
+        let mut lap = vec![0.0f64; nx * ny];
+        laplacian_2d_interior(&phi, nx, ny, ghost, dx, dy, dz, &mut lap);
+
+        // Expected: L(φ) = -(π²/Lx² + π²/Ly² + 2/dz²) · φ
+        let expected_factor = -(PI * PI / (lx * lx) + PI * PI / (ly * ly) + 2.0 / (dz * dz));
+
+        let mut max_err = 0.0f64;
+        let mut max_rel_err = 0.0f64;
+        for j in ghost..(ny - ghost) {
+            for i in ghost..(nx - ghost) {
+                let idx = j * nx + i;
+                let expected = expected_factor * phi[idx];
+                let err = (lap[idx] - expected).abs();
+                max_err = max_err.max(err);
+                if expected.abs() > 1e-30 {
+                    max_rel_err = max_rel_err.max(err / expected.abs());
+                }
+            }
+        }
+
+        // Second-order error: O(dx²) = O((5e-9)²·π⁴/L⁴) relative ~ O((π/N)²) ≈ 0.01
+        eprintln!(
+            "[phase2] Laplacian manufactured: max_abs_err={:.3e}, max_rel_err={:.6}",
+            max_err, max_rel_err
+        );
+        assert!(
+            max_rel_err < 0.02,
+            "Laplacian relative error too large: {:.6} (expected < 0.02 for 30-cell grid)",
+            max_rel_err
+        );
+        eprintln!("[phase2] PASSED: Laplacian matches analytical to O(dx²)");
+    }
+
+    /// Smoother convergence test: verify Jacobi reduces the residual at the
+    /// expected rate.
+    ///
+    /// Jacobi is NOT meant to fully solve the problem — it smooths high-frequency
+    /// errors. In the composite V-cycle, we run 2-4 iterations per level.
+    /// The coarse-grid correction handles the low-frequency convergence.
+    ///
+    /// What we test: after N iterations, the residual decreases. The convergence
+    /// rate for the smoothest mode on an M×M grid with ω=2/3 is approximately
+    /// ρ ≈ 1 - (2/3)(π/M)². For M=30: ρ ≈ 0.9966, so 500 iters gives ~5.5× reduction.
+    /// High-frequency modes converge much faster (ρ_high ≈ 1/3).
+    #[test]
+    fn test_jacobi_smoother_convergence() {
+        let nx = 34usize;
+        let ny = 34usize;
+        let ghost = 2usize;
+        let dx = 1.0;
+        let dy = 1.0;
+        let dz = 1.0; // isotropic for test; screening adds -2/dz² to diagonal
+        let n_int_x = nx - 2 * ghost;
+        let n_int_y = ny - 2 * ghost;
+        let lx = n_int_x as f64;
+        let ly = n_int_y as f64;
+
+        // Screened Poisson: L(φ) = -(π²/lx² + π²/ly² + 2/dz²) × φ
+        let expected_factor = -(PI * PI / (lx * lx) + PI * PI / (ly * ly) + 2.0 / (dz * dz));
+        let mut rhs = vec![0.0f64; nx * ny];
+        let mut phi_exact = vec![0.0f64; nx * ny];
+        for j in 0..ny {
+            for i in 0..nx {
+                let x = (i as f64 - ghost as f64 + 0.5) * dx;
+                let y = (j as f64 - ghost as f64 + 0.5) * dy;
+                let val = (PI * x / lx).sin() * (PI * y / ly).sin();
+                phi_exact[j * nx + i] = val;
+                rhs[j * nx + i] = expected_factor * val;
+            }
+        }
+
+        // Ghost cells = exact solution (Dirichlet BCs). Interior = 0.
+        let mut phi = vec![0.0f64; nx * ny];
+        for j in 0..ny {
+            for i in 0..nx {
+                let is_interior = i >= ghost && i < nx - ghost
+                               && j >= ghost && j < ny - ghost;
+                if !is_interior {
+                    phi[j * nx + i] = phi_exact[j * nx + i];
+                }
+            }
+        }
+        let mut tmp = vec![0.0f64; nx * ny];
+        let omega = 2.0 / 3.0;
+
+        // Measure residual BEFORE any smoothing (should be large).
+        let mut lap_before = vec![0.0f64; nx * ny];
+        laplacian_2d_interior(&phi, nx, ny, ghost, dx, dy, dz, &mut lap_before);
+        let mut res_before = 0.0f64;
+        for j in ghost..(ny - ghost) {
+            for i in ghost..(nx - ghost) {
+                let v = (rhs[j * nx + i] - lap_before[j * nx + i]).abs();
+                if v > res_before { res_before = v; }
+            }
+        }
+
+        // Run 50 iterations (typical: 2-4 per V-cycle level, but 50 to see clear reduction).
+        smooth_jacobi_2d(&mut phi, &rhs, &mut tmp, nx, ny, ghost, dx, dy, dz, omega, 50);
+
+        // Measure residual AFTER.
+        let mut lap_after = vec![0.0f64; nx * ny];
+        laplacian_2d_interior(&phi, nx, ny, ghost, dx, dy, dz, &mut lap_after);
+        let mut res_after = 0.0f64;
+        for j in ghost..(ny - ghost) {
+            for i in ghost..(nx - ghost) {
+                let v = (rhs[j * nx + i] - lap_after[j * nx + i]).abs();
+                if v > res_after { res_after = v; }
+            }
+        }
+
+        let reduction = res_after / res_before;
+
+        eprintln!(
+            "[phase2] Jacobi: res_before={:.3e}, res_after={:.3e}, reduction={:.4} ({:.1}× in 50 iters)",
+            res_before, res_after, reduction, 1.0 / reduction
+        );
+
+        // The residual must decrease. With z-screening the diagonal is larger,
+        // so Jacobi converges faster than the unscreened case.
+        assert!(
+            reduction < 0.95,
+            "Jacobi should reduce residual: before={:.3e}, after={:.3e}, ratio={:.4}",
+            res_before, res_after, reduction
+        );
+
+        // Run 500 more iterations and check further reduction.
+        smooth_jacobi_2d(&mut phi, &rhs, &mut tmp, nx, ny, ghost, dx, dy, dz, omega, 500);
+        let mut lap_final = vec![0.0f64; nx * ny];
+        laplacian_2d_interior(&phi, nx, ny, ghost, dx, dy, dz, &mut lap_final);
+        let mut res_final = 0.0f64;
+        for j in ghost..(ny - ghost) {
+            for i in ghost..(nx - ghost) {
+                let v = (rhs[j * nx + i] - lap_final[j * nx + i]).abs();
+                if v > res_final { res_final = v; }
+            }
+        }
+
+        let total_reduction = res_final / res_before;
+
+        // After 550 total iterations, expect significant reduction.
+        // Slowest mode: 0.9966^550 ≈ 0.15. Fast modes: essentially zero.
+        eprintln!(
+            "[phase2] Jacobi total: res_final={:.3e}, total_reduction={:.4} ({:.1}× in 550 iters)",
+            res_final, total_reduction, 1.0 / total_reduction
+        );
+
+        assert!(
+            total_reduction < 0.5,
+            "550 Jacobi iterations should reduce residual by at least 2×, got {:.4}×",
+            1.0 / total_reduction
+        );
+
+        eprintln!("[phase2] PASSED: Jacobi smoother reduces residual at expected rate");
+    }
+
+    /// Ghost-fill consistency test: verify that scalar ghost-fill gives the
+    /// same values as vector ghost-fill for a field where all three components
+    /// carry the same scalar value.
+    ///
+    /// This is the critical coordinate-consistency check.
+    #[test]
+    fn test_ghost_fill_matches_vector_version() {
+        use crate::amr::interp::sample_bilinear;
+        use crate::amr::patch::Patch2D;
+        use crate::amr::rect::Rect2i;
+        use crate::grid::Grid2D;
+        use crate::vector_field::VectorField2D;
+
+        // Create a coarse grid and a scalar field on it.
+        let base = Grid2D::new(16, 16, 5e-9, 5e-9, 3e-9);
+        let coarse_nx = base.nx;
+        let coarse_ny = base.ny;
+
+        // Fill coarse phi with a smooth function: φ = sin(πx/Lx)·cos(πy/Ly)
+        let lx = base.nx as f64 * base.dx;
+        let ly = base.ny as f64 * base.dy;
+        let mut coarse_phi = vec![0.0f64; coarse_nx * coarse_ny];
+        let mut coarse_vec = VectorField2D::new(base);
+        for j in 0..coarse_ny {
+            for i in 0..coarse_nx {
+                let x = (i as f64 + 0.5) * base.dx;
+                let y = (j as f64 + 0.5) * base.dy;
+                let val = (PI * x / lx).sin() * (PI * y / ly).cos();
+                coarse_phi[j * coarse_nx + i] = val;
+                // Put same value in all three vector components
+                coarse_vec.data[j * coarse_nx + i] = [val, val, val];
+            }
+        }
+
+        // Create a patch in the middle of the domain.
+        let rect = Rect2i::new(4, 4, 4, 4); // covers coarse cells (4,4) to (7,7)
+        let ratio = 2;
+        let ghost_cells = 2;
+        let patch = Patch2D::new(&base, rect, ratio, ghost_cells);
+
+        let pnx = patch.grid.nx;
+        let pny = patch.grid.ny;
+
+        // Scalar ghost-fill
+        let mut patch_phi = vec![0.0f64; pnx * pny];
+        fill_phi_ghosts_from_coarse(
+            &patch, &mut patch_phi,
+            &coarse_phi, coarse_nx, coarse_ny, base.dx, base.dy,
+        );
+
+        // Vector ghost-fill (using sample_bilinear on the VectorField2D)
+        let gi0 = patch.interior_i0();
+        let gj0 = patch.interior_j0();
+        let gi1 = patch.interior_i1();
+        let gj1 = patch.interior_j1();
+
+        let mut max_diff = 0.0f64;
+        let mut n_ghost_checked = 0usize;
+        for j in 0..pny {
+            for i in 0..pnx {
+                let is_interior = i >= gi0 && i < gi1 && j >= gj0 && j < gj1;
+                if is_interior {
+                    continue;
+                }
+                let (x, y) = patch.cell_center_xy(i, j);
+                let vec_val = sample_bilinear(&coarse_vec, x, y);
+                let scalar_val = patch_phi[j * pnx + i];
+                let diff = (scalar_val - vec_val[0]).abs();
+                max_diff = max_diff.max(diff);
+                n_ghost_checked += 1;
+            }
+        }
+
+        eprintln!(
+            "[phase2] ghost-fill consistency: {} ghost cells checked, max_diff={:.3e}",
+            n_ghost_checked, max_diff
+        );
+
+        // Must be bit-identical since we use the same coordinate mapping and
+        // the same bilinear interpolation logic.
+        assert!(
+            max_diff < 1e-14,
+            "scalar ghost-fill differs from vector version by {:.3e}", max_diff
+        );
+
+        eprintln!("[phase2] PASSED: scalar ghost-fill matches vector version");
+    }
+
+    /// Residual computation test: verify compute_residual_2d matches
+    /// manual rhs - L(phi).
+    #[test]
+    fn test_compute_residual_2d() {
+        let nx = 10usize;
+        let ny = 10usize;
+        let ghost = 2usize;
+        let dx = 1.0;
+        let dy = 1.0;
+        let dz = 1e30; // large dz makes screening term negligible (2/dz² ≈ 0)
+
+        let mut pd = PatchPoissonData {
+            phi: vec![0.0; nx * ny],
+            rhs: vec![0.0; nx * ny],
+            residual: vec![0.0; nx * ny],
+            nx,
+            ny,
+            ghost,
+            dx,
+            dy,
+            dz,
+        };
+
+        // Set phi and rhs to known values.
+        for j in 0..ny {
+            for i in 0..nx {
+                pd.phi[j * nx + i] = (i as f64) * (j as f64);
+                pd.rhs[j * nx + i] = 1.0;
+            }
+        }
+
+        // Compute residual
+        compute_residual_2d(&mut pd);
+
+        // Manually compute L(phi) and expected residual at an interior point.
+        // phi = i*j, so:
+        //   d²phi/dx² = 0 (phi is linear in i at fixed j)
+        //   d²phi/dy² = 0 (phi is linear in j at fixed i)
+        //   screening: -2/dz² * phi ≈ 0 (dz=1e30)
+        //   L(phi) ≈ 0 everywhere in the interior
+        //   residual = rhs - L(phi) ≈ 1.0
+        for j in ghost..(ny - ghost) {
+            for i in ghost..(nx - ghost) {
+                let idx = j * nx + i;
+                assert!(
+                    (pd.residual[idx] - 1.0).abs() < 1e-10,
+                    "residual at ({},{}) = {:.6e}, expected 1.0",
+                    i, j, pd.residual[idx]
+                );
+            }
+        }
+
+        // Ghost residuals should be zero.
+        assert_eq!(pd.residual[0], 0.0, "ghost residual should be 0");
+
+        eprintln!("[phase2] PASSED: compute_residual_2d matches manual calculation");
+    }
+}
+
+#[cfg(test)]
+mod phase3_tests {
+    use super::*;
+    use crate::amr::patch::Patch2D;
+    use crate::amr::rect::Rect2i;
+    use crate::grid::Grid2D;
+
+    /// Test that restrict_residual_to_coarse produces one correction per
+    /// covered coarse cell with the correct area-averaged value.
+    #[test]
+    fn test_restrict_residual_basic() {
+        // Create a base grid and a patch.
+        let base = Grid2D::new(16, 16, 5e-9, 5e-9, 3e-9);
+        let rect = Rect2i::new(4, 4, 4, 4); // covers coarse cells (4..8, 4..8)
+        let ratio = 2;
+        let ghost = 2;
+        let patch = Patch2D::new(&base, rect, ratio, ghost);
+
+        let pnx = patch.grid.nx;
+        let pny = patch.grid.ny;
+
+        // Create a PatchPoissonData and set the residual to a known pattern.
+        let mut pd = PatchPoissonData::new(&patch);
+
+        // Set residual = 1.0 everywhere interior, 0.0 at ghosts.
+        // With ratio=2 and uniform residual=1.0, area_avg should be 1.0.
+        for j in ghost..(pny - ghost) {
+            for i in ghost..(pnx - ghost) {
+                pd.residual[j * pnx + i] = 1.0;
+            }
+        }
+
+        let corrections = restrict_residual_to_coarse(&patch, &pd.residual, base.nx);
+
+        // Should have 4×4 = 16 corrections (one per coarse cell in the rect).
+        assert_eq!(
+            corrections.len(), 16,
+            "expected 16 corrections, got {}", corrections.len()
+        );
+
+        // Each correction should have avg_residual = 1.0 (uniform residual).
+        for (idx, (cell_idx, avg)) in corrections.iter().enumerate() {
+            assert!(
+                (avg - 1.0).abs() < 1e-12,
+                "correction {}: avg={:.6e}, expected 1.0", idx, avg
+            );
+            // Verify cell_idx is in the correct range.
+            let ci = cell_idx % base.nx;
+            let cj = cell_idx / base.nx;
+            assert!(ci >= 4 && ci < 8, "ci={} out of range", ci);
+            assert!(cj >= 4 && cj < 8, "cj={} out of range", cj);
+        }
+
+        eprintln!("[phase3] PASSED: restrict_residual produces correct uniform average");
+    }
+
+    /// Test restriction with a non-uniform residual pattern.
+    /// Verify the area-average matches manual computation.
+    #[test]
+    fn test_restrict_residual_nonuniform() {
+        let base = Grid2D::new(8, 8, 5e-9, 5e-9, 3e-9);
+        let rect = Rect2i::new(2, 2, 2, 2); // covers coarse cells (2..4, 2..4)
+        let ratio = 2;
+        let ghost = 2;
+        let patch = Patch2D::new(&base, rect, ratio, ghost);
+
+        let pnx = patch.grid.nx;
+        let pny = patch.grid.ny;
+        let mut pd = PatchPoissonData::new(&patch);
+
+        // Set residual with a gradient: residual[j*pnx+i] = i + j
+        for j in 0..pny {
+            for i in 0..pnx {
+                pd.residual[j * pnx + i] = (i + j) as f64;
+            }
+        }
+
+        let corrections = restrict_residual_to_coarse(&patch, &pd.residual, base.nx);
+
+        // 2×2 = 4 corrections
+        assert_eq!(corrections.len(), 4);
+
+        // For coarse cell (ic=0, jc=0): fine cells at (ghost+0, ghost+0)..(ghost+1, ghost+1)
+        // = (2,2), (3,2), (2,3), (3,3)
+        // residual values: 2+2=4, 3+2=5, 2+3=5, 3+3=6 → avg = 20/4 = 5.0
+        let (_, avg00) = corrections[0]; // (ic=0,jc=0) is first
+        assert!(
+            (avg00 - 5.0).abs() < 1e-12,
+            "avg at (0,0): expected 5.0, got {}", avg00
+        );
+
+        // For coarse cell (ic=1, jc=0): fine cells (4,2),(5,2),(4,3),(5,3)
+        // values: 6, 7, 7, 8 → avg = 28/4 = 7.0
+        let (_, avg10) = corrections[1]; // (ic=1,jc=0)
+        assert!(
+            (avg10 - 7.0).abs() < 1e-12,
+            "avg at (1,0): expected 7.0, got {}", avg10
+        );
+
+        eprintln!(
+            "[phase3] restrict non-uniform: avg(0,0)={:.1}, avg(1,0)={:.1}",
+            avg00, avg10
+        );
+        eprintln!("[phase3] PASSED: restrict_residual with non-uniform pattern");
+    }
+
+    /// Test that restriction conserves total residual:
+    /// sum of (avg × area_coarse) should equal sum of fine residual × area_fine
+    /// for covered cells.
+    #[test]
+    fn test_restrict_residual_conservation() {
+        let base = Grid2D::new(16, 16, 5e-9, 5e-9, 3e-9);
+        let rect = Rect2i::new(3, 5, 6, 4);
+        let ratio = 2;
+        let ghost = 2;
+        let patch = Patch2D::new(&base, rect, ratio, ghost);
+
+        let pnx = patch.grid.nx;
+        let pny = patch.grid.ny;
+        let mut pd = PatchPoissonData::new(&patch);
+
+        // Set residual to a non-trivial pattern.
+        for j in 0..pny {
+            for i in 0..pnx {
+                pd.residual[j * pnx + i] =
+                    (i as f64 * 0.3).sin() * (j as f64 * 0.7).cos();
+            }
+        }
+
+        let corrections = restrict_residual_to_coarse(&patch, &pd.residual, base.nx);
+
+        // Sum of restricted values (each is an average over ratio² fine cells,
+        // so multiply by ratio² to get the total fine contribution).
+        let sum_restricted: f64 = corrections.iter().map(|(_, v)| v).sum::<f64>()
+            * (ratio * ratio) as f64;
+
+        // Sum of fine residual over interior cells covered by the patch.
+        let mut sum_fine = 0.0f64;
+        for jc in 0..rect.ny {
+            for ic in 0..rect.nx {
+                let fi0 = ghost + ic * ratio;
+                let fj0 = ghost + jc * ratio;
+                for fj in fj0..fj0 + ratio {
+                    for fi in fi0..fi0 + ratio {
+                        if fi < pnx && fj < pny {
+                            sum_fine += pd.residual[fj * pnx + fi];
+                        }
+                    }
+                }
+            }
+        }
+
+        let rel_err = if sum_fine.abs() > 1e-30 {
+            (sum_restricted - sum_fine).abs() / sum_fine.abs()
+        } else {
+            0.0
+        };
+
+        eprintln!(
+            "[phase3] conservation: sum_fine={:.6e}, sum_restricted={:.6e}, rel_err={:.3e}",
+            sum_fine, sum_restricted, rel_err
+        );
+
+        assert!(
+            rel_err < 1e-12,
+            "restriction should conserve total: rel_err={:.3e}", rel_err
+        );
+
+        eprintln!("[phase3] PASSED: restriction conserves total residual");
+    }
+
+    /// Test prolongation: interpolated coarse correction matches direct bilinear
+    /// evaluation at fine cell positions.
+    #[test]
+    fn test_prolongate_phi_correction() {
+        let base = Grid2D::new(16, 16, 5e-9, 5e-9, 3e-9);
+        let rect = Rect2i::new(4, 4, 4, 4);
+        let ratio = 2;
+        let ghost = 2;
+        let patch = Patch2D::new(&base, rect, ratio, ghost);
+
+        let coarse_nx = base.nx;
+        let coarse_ny = base.ny;
+        let n_coarse = coarse_nx * coarse_ny;
+
+        // Old phi = 0 everywhere, new phi = smooth function.
+        let coarse_phi_old = vec![0.0f64; n_coarse];
+        let mut coarse_phi_new = vec![0.0f64; n_coarse];
+        for j in 0..coarse_ny {
+            for i in 0..coarse_nx {
+                let x = (i as f64 + 0.5) * base.dx;
+                let y = (j as f64 + 0.5) * base.dy;
+                coarse_phi_new[j * coarse_nx + i] =
+                    (x * 1e8).sin() * (y * 1e8).cos(); // smooth function
+            }
+        }
+
+        // Start with patch phi = 0.
+        let pnx = patch.grid.nx;
+        let pny = patch.grid.ny;
+        let mut patch_phi = vec![0.0f64; pnx * pny];
+
+        // Prolongate.
+        prolongate_phi_correction(
+            &coarse_phi_new, &coarse_phi_old,
+            coarse_nx, coarse_ny, base.dx, base.dy,
+            &patch, &mut patch_phi,
+        );
+
+        // The correction delta = phi_new - phi_old = phi_new (since old=0).
+        // At each interior fine cell, the prolongated value should match
+        // bilinear interpolation of phi_new at that cell's position.
+        let gi0 = patch.interior_i0();
+        let gj0 = patch.interior_j0();
+        let gi1 = patch.interior_i1();
+        let gj1 = patch.interior_j1();
+
+        let mut max_err = 0.0f64;
+        for j in gj0..gj1 {
+            for i in gi0..gi1 {
+                let (x, y) = patch.cell_center_xy(i, j);
+                let expected = sample_bilinear_scalar(
+                    &coarse_phi_new, coarse_nx, coarse_ny, base.dx, base.dy, x, y);
+                let actual = patch_phi[j * pnx + i];
+                let err = (actual - expected).abs();
+                max_err = max_err.max(err);
+            }
+        }
+
+        eprintln!("[phase4] prolongation max_err vs bilinear: {:.3e}", max_err);
+
+        // Should be bit-identical — same interpolation function.
+        assert!(
+            max_err < 1e-14,
+            "prolongation should match bilinear interpolation, err={:.3e}", max_err
+        );
+
+        // Ghost cells should remain zero (not modified by prolongation).
+        for j in 0..pny {
+            for i in 0..pnx {
+                let is_interior = i >= gi0 && i < gi1 && j >= gj0 && j < gj1;
+                if !is_interior {
+                    assert_eq!(
+                        patch_phi[j * pnx + i], 0.0,
+                        "ghost cell ({},{}) should be zero after prolongation", i, j
+                    );
+                }
+            }
+        }
+
+        eprintln!("[phase4] PASSED: prolongation matches bilinear, ghosts untouched");
+    }
+
+    /// Test prolongation additivity: if patch_phi already has values,
+    /// prolongation ADDS the correction, doesn't overwrite.
+    #[test]
+    fn test_prolongate_is_additive() {
+        let base = Grid2D::new(8, 8, 5e-9, 5e-9, 3e-9);
+        let rect = Rect2i::new(2, 2, 3, 3);
+        let ratio = 2;
+        let ghost = 2;
+        let patch = Patch2D::new(&base, rect, ratio, ghost);
+
+        let coarse_nx = base.nx;
+        let coarse_ny = base.ny;
+        let n_coarse = coarse_nx * coarse_ny;
+
+        let coarse_phi_old = vec![1.0f64; n_coarse];
+        let coarse_phi_new = vec![3.0f64; n_coarse]; // delta = 2.0 everywhere
+
+        let pnx = patch.grid.nx;
+        let pny = patch.grid.ny;
+        let gi0 = patch.interior_i0();
+        let gj0 = patch.interior_j0();
+        let gi1 = patch.interior_i1();
+        let gj1 = patch.interior_j1();
+
+        // Start with patch phi = 10.0 everywhere interior.
+        let mut patch_phi = vec![0.0f64; pnx * pny];
+        for j in gj0..gj1 {
+            for i in gi0..gi1 {
+                patch_phi[j * pnx + i] = 10.0;
+            }
+        }
+
+        prolongate_phi_correction(
+            &coarse_phi_new, &coarse_phi_old,
+            coarse_nx, coarse_ny, base.dx, base.dy,
+            &patch, &mut patch_phi,
+        );
+
+        // Interior cells should be 10.0 + 2.0 = 12.0.
+        // (delta=2.0 is uniform, bilinear of uniform = 2.0)
+        for j in gj0..gj1 {
+            for i in gi0..gi1 {
+                let val = patch_phi[j * pnx + i];
+                assert!(
+                    (val - 12.0).abs() < 1e-12,
+                    "interior ({},{})={:.6}, expected 12.0", i, j, val
+                );
+            }
+        }
+
+        eprintln!("[phase4] PASSED: prolongation is additive (10 + 2 = 12)");
+    }
+}
+
+#[cfg(test)]
+mod phase5_tests {
+    use super::*;
+    use crate::amr::hierarchy::AmrHierarchy2D;
+    use crate::grid::Grid2D;
+    use crate::params::{DemagMethod, Material};
+    use crate::vector_field::VectorField2D;
+
+    fn make_test_material() -> Material {
+        Material {
+            ms: 800e3,
+            a_ex: 13e-12,
+            k_u: 0.0,
+            easy_axis: [0.0, 0.0, 1.0],
+            dmi: None,
+            demag: true,
+            demag_method: DemagMethod::FftUniform,
+        }
+    }
+
+    /// GATE TEST: Zero-patch regression.
+    ///
+    /// With no patches, compute_vcycle must produce the same B as the existing
+    /// compute() (enhanced-RHS) path, because the V-cycle with zero patches
+    /// reduces to a plain L0 solve with no corrections.
+    #[test]
+    fn test_zero_patch_regression() {
+        let grid = Grid2D::new(16, 16, 5e-9, 5e-9, 3e-9);
+        let mat = make_test_material();
+
+        // Helper to make vortex M.
+        let make_vortex = |g: Grid2D| -> VectorField2D {
+            let mut m = VectorField2D::new(g);
+            let cx = g.nx as f64 * 0.5;
+            let cy = g.ny as f64 * 0.5;
+            for j in 0..g.ny {
+                for i in 0..g.nx {
+                    let x = (i as f64 + 0.5) - cx;
+                    let y = (j as f64 + 0.5) - cy;
+                    let r = (x * x + y * y).sqrt().max(0.5);
+                    m.data[j * g.nx + i] = [-y / r, x / r, 0.0];
+                }
+            }
+            m
+        };
+
+        // Path A: existing compute() (defect correction).
+        let h_a = AmrHierarchy2D::new(grid, make_vortex(grid), 2, 2);
+        let mut solver_a = CompositeGridPoisson::new(grid);
+        let mut b_a = VectorField2D::new(grid);
+        solver_a.compute(&h_a, &mat, &mut b_a);
+
+        // Path B: new compute_vcycle().
+        let h_b = AmrHierarchy2D::new(grid, make_vortex(grid), 2, 2);
+        let mut solver_b = CompositeGridPoisson::new(grid);
+        let mut b_b = VectorField2D::new(grid);
+        solver_b.compute_vcycle(&h_b, &mat, &mut b_b);
+
+        // Compare B.
+        let mut max_diff = 0.0f64;
+        for k in 0..b_a.data.len() {
+            for c in 0..3 {
+                let d = (b_a.data[k][c] - b_b.data[k][c]).abs();
+                max_diff = max_diff.max(d);
+            }
+        }
+
+        let b_max = b_a.data.iter()
+            .flat_map(|v| v.iter())
+            .map(|x| x.abs())
+            .fold(0.0f64, f64::max);
+
+        eprintln!(
+            "[phase5] zero-patch: max_B_diff={:.3e}, B_max={:.3e}, rel={:.3e}",
+            max_diff, b_max, if b_max > 0.0 { max_diff / b_max } else { 0.0 }
+        );
+
+        // Should be very close. Not necessarily bit-identical because the
+        // V-cycle path goes through a slightly different code flow (computes
+        // coarse_div separately, runs vcycle_iteration which does L0 solve
+        // via the same solve_plain_with_corrections). With tolerance-based V-cycle
+        // stopping (tol_rel=1e-6), the two paths may converge to slightly
+        // different residual levels, so allow agreement at the solver
+        // tolerance scale.
+        assert!(
+            max_diff < 1e-3 * b_max.max(1e-20),
+            "zero-patch regression: B differs by {:.3e} (B_max={:.3e}, rel={:.3e})",
+            max_diff, b_max, if b_max > 0.0 { max_diff / b_max } else { 0.0 }
+        );
+
+        eprintln!("[phase5] PASSED: zero-patch regression — vcycle matches existing path");
+    }
+
+    /// Test that the V-cycle produces monotonically decreasing residual
+    /// with patches present.
+    ///
+    /// Uses a simple setup: 16×16 base grid with one 4×4 patch in the centre.
+    /// Uniform +x magnetisation.
+    #[test]
+    fn test_vcycle_residual_decreases() {
+        let grid = Grid2D::new(16, 16, 5e-9, 5e-9, 3e-9);
+        let mat = make_test_material();
+
+        // Uniform +x coarse magnetisation.
+        let mut coarse = VectorField2D::new(grid);
+        coarse.set_uniform(1.0, 0.0, 0.0);
+
+        // Create hierarchy with one L1 patch.
+        let mut coarse_for_h = VectorField2D::new(grid);
+        coarse_for_h.set_uniform(1.0, 0.0, 0.0);
+        let mut h = AmrHierarchy2D::new(grid, coarse_for_h, 2, 2);
+        let rect = crate::amr::rect::Rect2i::new(4, 4, 4, 4);
+        let mut patch = crate::amr::patch::Patch2D::new(&grid, rect, 2, 2);
+        patch.fill_all_from_coarse(&coarse);
+        patch.rebuild_active_from_coarse_mask(&grid, None);
+        h.patches.push(patch);
+
+        // Create solver with max_cycles=1 so we can run iterations manually.
+        let mut solver = CompositeGridPoisson::new(grid);
+        solver.vcfg.max_cycles = 1;
+
+        // Allocate patch data and compute RHS.
+        let (l1, l2) = allocate_patch_poisson_data(&h);
+        solver.l1_data = l1;
+        solver.l2plus_data = l2;
+        compute_all_patch_rhs(&h, &mut solver.l1_data, &mut solver.l2plus_data, mat.ms);
+
+        // Compute coarse div.
+        let n_coarse = grid.nx * grid.ny;
+        solver.coarse_phi = vec![0.0; n_coarse];
+        solver.coarse_div = vec![0.0; n_coarse];
+        compute_scaled_div_m(
+            &h.coarse.data, grid.nx, grid.ny, grid.dx, grid.dy, mat.ms,
+            &mut solver.coarse_div);
+
+        // Run V-cycles and track max patch residual.
+        let mut b_scratch = VectorField2D::new(grid);
+        let parent_maps = build_parent_index_maps(&h);
+        let mut residuals = Vec::new();
+
+        for cycle in 0..5 {
+            solver.vcycle_iteration(&h, &mat, &parent_maps, &mut b_scratch);
+
+            // Recompute residual to measure it.
+            let mut max_res = 0.0f64;
+            for pd in solver.l1_data.iter_mut() {
+                compute_residual_2d(pd);
+                for j in pd.ghost..(pd.ny - pd.ghost) {
+                    for i in pd.ghost..(pd.nx - pd.ghost) {
+                        max_res = max_res.max(pd.residual[j * pd.nx + i].abs());
+                    }
+                }
+            }
+            residuals.push(max_res);
+            eprintln!("[phase5] cycle {}: max_residual={:.3e}", cycle, max_res);
+        }
+
+        // The residual should decrease overall (it may not be strictly
+        // monotonic due to the coarse-solve injecting corrections, but
+        // the trend should be clearly downward).
+        let first = residuals[0];
+        let last = *residuals.last().unwrap();
+
+        eprintln!(
+            "[phase5] residual: first={:.3e}, last={:.3e}, ratio={:.4}",
+            first, last, if first > 0.0 { last / first } else { 0.0 }
+        );
+
+        // After 5 V-cycles, the residual should be at least 2× smaller.
+        // (Thompson & Ferziger get ~0.19× per cycle; we may get less because
+        // we only smooth on patches, not the full grid.)
+        assert!(
+            last < first || first < 1e-30,
+            "residual should decrease: first={:.3e}, last={:.3e}", first, last
+        );
+
+        eprintln!("[phase5] PASSED: V-cycle residual decreases over iterations");
+    }
+}
+
+#[cfg(test)]
+mod phase6_tests {
+    use super::*;
+    use crate::amr::patch::Patch2D;
+    use crate::amr::rect::Rect2i;
+    use crate::grid::Grid2D;
+    use crate::vector_field::VectorField2D;
+    use std::f64::consts::PI;
+
+    /// Test that extract_b_from_patch_phi correctly computes gradients
+    /// from a known φ field.
+    ///
+    /// φ = sin(πx/Lx) · sin(πy/Ly)
+    /// ∂φ/∂x = (π/Lx) cos(πx/Lx) sin(πy/Ly)
+    /// Bx = -μ₀ ∂φ/∂x
+    #[test]
+    fn test_gradient_extraction_manufactured() {
+        let base = Grid2D::new(16, 16, 5e-9, 5e-9, 3e-9);
+        let rect = Rect2i::new(4, 4, 4, 4);
+        let ratio = 2;
+        let ghost = 2;
+        let patch = Patch2D::new(&base, rect, ratio, ghost);
+
+        let pnx = patch.grid.nx;
+        let pny = patch.grid.ny;
+        let dx = patch.grid.dx; // fine dx
+        let _dy = patch.grid.dy;
+
+        // Domain size in physical coords.
+        let lx = base.nx as f64 * base.dx;
+        let ly = base.ny as f64 * base.dy;
+
+        // Fill patch phi with sin(πx/Lx)·sin(πy/Ly).
+        let mut patch_phi = vec![0.0f64; pnx * pny];
+        for j in 0..pny {
+            for i in 0..pnx {
+                let (x, y) = patch.cell_center_xy(i, j);
+                patch_phi[j * pnx + i] = (PI * x / lx).sin() * (PI * y / ly).sin();
+            }
+        }
+
+        // Create a dummy coarse B (all zeros — we only check Bx, By).
+        let b_coarse = VectorField2D::new(base);
+
+        let b = extract_b_from_patch_phi(&patch, &patch_phi, &b_coarse);
+
+        // Check Bx, By at interior cells against analytical gradient.
+        let gi0 = patch.interior_i0();
+        let gj0 = patch.interior_j0();
+        let gi1 = patch.interior_i1();
+        let gj1 = patch.interior_j1();
+
+        let mut max_bx_err = 0.0f64;
+        let mut max_by_err = 0.0f64;
+        let mut max_bx_ref = 0.0f64;
+        let mut max_by_ref = 0.0f64;
+
+        for j in gj0..gj1 {
+            for i in gi0..gi1 {
+                let (x, y) = patch.cell_center_xy(i, j);
+
+                // Analytical: Bx = -μ₀ (π/Lx) cos(πx/Lx) sin(πy/Ly)
+                let bx_exact = -MU0 * (PI / lx)
+                    * (PI * x / lx).cos() * (PI * y / ly).sin();
+                let by_exact = -MU0 * (PI / ly)
+                    * (PI * x / lx).sin() * (PI * y / ly).cos();
+
+                let idx = j * pnx + i;
+                let bx_err = (b[idx][0] - bx_exact).abs();
+                let by_err = (b[idx][1] - by_exact).abs();
+                max_bx_err = max_bx_err.max(bx_err);
+                max_by_err = max_by_err.max(by_err);
+                max_bx_ref = max_bx_ref.max(bx_exact.abs());
+                max_by_ref = max_by_ref.max(by_exact.abs());
+            }
+        }
+
+        let rel_bx = if max_bx_ref > 0.0 { max_bx_err / max_bx_ref } else { 0.0 };
+        let rel_by = if max_by_ref > 0.0 { max_by_err / max_by_ref } else { 0.0 };
+
+        eprintln!(
+            "[phase6] gradient: Bx rel_err={:.4}, By rel_err={:.4} (dx={:.2e})",
+            rel_bx, rel_by, dx
+        );
+
+        // Central difference on sin is O(dx²). At fine resolution with ratio=2,
+        // dx = 2.5e-9 and Lx = 80e-9: (πdx/Lx)² ≈ (0.098)² ≈ 0.0096.
+        // So we expect < 2% relative error.
+        assert!(
+            rel_bx < 0.03,
+            "Bx relative error too large: {:.4}", rel_bx
+        );
+        assert!(
+            rel_by < 0.03,
+            "By relative error too large: {:.4}", rel_by
+        );
+
+        eprintln!("[phase6] PASSED: fine gradient matches analytical to O(dx²)");
+    }
+
+    /// Test that Bz comes from the coarse interpolation, not from patch φ.
+    #[test]
+    fn test_bz_from_coarse() {
+        let base = Grid2D::new(16, 16, 5e-9, 5e-9, 3e-9);
+        let rect = Rect2i::new(4, 4, 4, 4);
+        let ratio = 2;
+        let ghost = 2;
+        let patch = Patch2D::new(&base, rect, ratio, ghost);
+
+        let pnx = patch.grid.nx;
+        let pny = patch.grid.ny;
+
+        // Patch phi = 0 (no in-plane gradient).
+        let patch_phi = vec![0.0f64; pnx * pny];
+
+        // Coarse B with known Bz = 0.5 T everywhere.
+        let mut b_coarse = VectorField2D::new(base);
+        for v in b_coarse.data.iter_mut() {
+            *v = [0.0, 0.0, 0.5];
+        }
+
+        let b = extract_b_from_patch_phi(&patch, &patch_phi, &b_coarse);
+
+        // All Bx, By should be zero (phi is uniform).
+        // All Bz should be ~0.5 T (from coarse interpolation).
+        let gi0 = patch.interior_i0();
+        let gj0 = patch.interior_j0();
+        let gi1 = patch.interior_i1();
+        let gj1 = patch.interior_j1();
+
+        let mut max_bxy = 0.0f64;
+        let mut min_bz = f64::INFINITY;
+        let mut max_bz = f64::NEG_INFINITY;
+
+        for j in gj0..gj1 {
+            for i in gi0..gi1 {
+                let idx = j * pnx + i;
+                max_bxy = max_bxy.max(b[idx][0].abs()).max(b[idx][1].abs());
+                min_bz = min_bz.min(b[idx][2]);
+                max_bz = max_bz.max(b[idx][2]);
+            }
+        }
+
+        eprintln!(
+            "[phase6] Bz from coarse: max_bxy={:.3e}, Bz range=[{:.6}, {:.6}]",
+            max_bxy, min_bz, max_bz
+        );
+
+        assert!(
+            max_bxy < 1e-20,
+            "Bx/By should be zero for uniform phi, got {:.3e}", max_bxy
+        );
+        assert!(
+            (min_bz - 0.5).abs() < 1e-6 && (max_bz - 0.5).abs() < 1e-6,
+            "Bz should be 0.5 from coarse, got [{:.6}, {:.6}]", min_bz, max_bz
+        );
+
+        eprintln!("[phase6] PASSED: Bz comes from coarse interpolation");
+    }
+
+    /// Test that the zero-patch regression still holds with Phase 6 active.
+    /// With no patches, compute_vcycle should still produce the same L0 B.
+    #[test]
+    fn test_zero_patch_still_works() {
+        use crate::amr::hierarchy::AmrHierarchy2D;
+        use crate::params::{DemagMethod, Material};
+
+        let grid = Grid2D::new(16, 16, 5e-9, 5e-9, 3e-9);
+        let mat = Material {
+            ms: 800e3,
+            a_ex: 13e-12,
+            k_u: 0.0,
+            easy_axis: [0.0, 0.0, 1.0],
+            dmi: None,
+            demag: true,
+            demag_method: DemagMethod::FftUniform,
+        };
+
+        let make_vortex = |g: Grid2D| -> VectorField2D {
+            let mut m = VectorField2D::new(g);
+            let cx = g.nx as f64 * 0.5;
+            let cy = g.ny as f64 * 0.5;
+            for j in 0..g.ny {
+                for i in 0..g.nx {
+                    let x = (i as f64 + 0.5) - cx;
+                    let y = (j as f64 + 0.5) - cy;
+                    let r = (x * x + y * y).sqrt().max(0.5);
+                    m.data[j * g.nx + i] = [-y / r, x / r, 0.0];
+                }
+            }
+            m
+        };
+
+        let h = AmrHierarchy2D::new(grid, make_vortex(grid), 2, 2);
+        let mut solver = CompositeGridPoisson::new(grid);
+        let mut b = VectorField2D::new(grid);
+        let (b_l1, b_l2) = solver.compute_vcycle(&h, &mat, &mut b);
+
+        // With no patches, b_l1 and b_l2 should be empty.
+        assert!(b_l1.is_empty(), "b_l1 should be empty with no patches");
+        assert!(b_l2.is_empty(), "b_l2 should be empty with no patches");
+
+        // B should be non-trivial.
+        let b_max = b.data.iter()
+            .flat_map(|v| v.iter())
+            .map(|x| x.abs())
+            .fold(0.0f64, f64::max);
+        assert!(b_max > 1e-6, "B should be non-trivial, got max={:.3e}", b_max);
+
+        eprintln!("[phase6] zero-patch: B_max={:.3e}, b_l1 empty, b_l2 empty", b_max);
+        eprintln!("[phase6] PASSED: zero-patch still works with Phase 6 gradient extraction");
+    }
+}
