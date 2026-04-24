@@ -76,6 +76,11 @@ cargo run --release --bin demag_cube
 cargo run --release --bin demag_2d
 ```
 
+> **Note on runtime.**
+   > The AMR benchmarks (anti-dot sweep, vortex gyration) can take tens of
+   > minutes to several hours on a standard computer. Component-level tests
+   > in Appendix A run in seconds. `RAYON_NUM_THREADS` controls parallelism.
+
 ## License
 
 MIT
