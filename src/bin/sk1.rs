@@ -9,6 +9,16 @@
 //! Note: D2 (3D padded-box RHS diagnostics) removed — the new 2D cell-centred MG
 //! solver no longer uses a 3D padded domain.
 
+fn main() -> std::io::Result<()> {
+    let mut args = std::env::args().skip(1);
+    let Some(case) = args.next() else {
+        eprintln!("Usage: cargo run --release --bin sk1 -- <a|b|c|d|e|f>");
+        std::process::exit(2);
+    };
+    let c = case.chars().next().unwrap_or('a');
+    run(c)
+}
+
 use std::collections::VecDeque;
 use std::fs::{File, create_dir_all};
 use std::io::{self, Write};
