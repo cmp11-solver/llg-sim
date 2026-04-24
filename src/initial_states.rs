@@ -299,9 +299,6 @@ pub fn seed_reversed_cores(
 
 /// Seed multiple smooth "bubble" domains with a finite wall width.
 ///
-/// This avoids the discontinuous step in `seed_reversed_cores`, which can create
-/// extremely sharp gradients (and overly sensitive AMR indicators) at t=0.
-///
 /// The profile is a smooth 180° rotation as a function of radius from the nearest center:
 ///   mz(r) = s * tanh((r - r0)/w)
 /// where `s = sign(outer_polarity)` so that outside is ±z and inside is ∓z.

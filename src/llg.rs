@@ -65,8 +65,8 @@ fn combo_rk4(k1: [f64; 3], k2: [f64; 3], k3: [f64; 3], k4: [f64; 3]) -> [f64; 3]
 
 /// Add an external field contribution (Tesla) into an already-built stage field.
 ///
-/// This is used for Phase-2 demag bridge mode, where we compute demag separately and
-/// add it as a frozen field addend for the whole RK step.
+/// Used for bridge-mode demag integration: the demag field is computed separately
+/// and added as a frozen field addend across the whole RK step.
 #[inline]
 fn add_field_inplace(dst: &mut VectorField2D, b_add: Option<&VectorField2D>) {
     if let Some(b) = b_add {
@@ -194,18 +194,15 @@ impl RK45Scratch {
 /// This is the MuMax-style choice for Relax(): adaptive 3rd-order with an
 /// embedded 2nd-order estimate for error control.
 pub struct RK23Scratch {
-    // Stage magnetisations
     m2: VectorField2D,
     m3: VectorField2D,
-    m4: VectorField2D, // 3rd-order solution (accepted state)
+    m4: VectorField2D,
 
-    // Stage fields
     b1: VectorField2D,
     b2: VectorField2D,
     b3: VectorField2D,
     b4: VectorField2D,
 
-    // Stage torques
     k1: Vec<[f64; 3]>,
     k2: Vec<[f64; 3]>,
     k3: Vec<[f64; 3]>,
@@ -215,8 +212,6 @@ pub struct RK23Scratch {
     // This lets higher-level routines reuse the last computed field for torque checks.
     last_b_eff_valid: bool,
 
-    // FSAL safety: only reuse the last accepted stage-4 field/torque as the next step's stage-1
-    // if the field mask and external field are unchanged.
     last_mask: Option<FieldMask>,
     last_b_ext: Option<[f64; 3]>,
 }
@@ -308,9 +303,6 @@ pub fn step_llg_rk23_recompute_field_masked_relax_adaptive(
     const BH3: f64 = 1.0 / 3.0;
     const BH4: f64 = 1.0 / 8.0;
 
-    // -----------------------
-    // Stage 1: k1 at m (FSAL-aware)
-    // -----------------------
     // Bogacki–Shampine RK23 is FSAL: if the previous step was accepted, k4/b4 are
     // evaluated at the accepted state and can be reused as the next step's k1/b1,
     // provided nothing affecting B_eff changed.
@@ -319,7 +311,6 @@ pub fn step_llg_rk23_recompute_field_masked_relax_adaptive(
         && scratch.last_b_ext == Some(params.b_ext);
 
     if fsal_ok {
-        // Reuse last accepted stage-4 field/torque as current stage-1.
         scratch.b1.data.clone_from(&scratch.b4.data);
         scratch.k1.clone_from(&scratch.k4);
     } else {
@@ -329,9 +320,6 @@ pub fn step_llg_rk23_recompute_field_masked_relax_adaptive(
         }
     }
 
-    // -----------------------
-    // Stage 2: m2 = m + dt*(1/2)*k1
-    // -----------------------
     for i in 0..n {
         let v = add_scaled(m.data[i], dt0 * A21, scratch.k1[i]);
         scratch.m2.data[i] = normalize(v);
@@ -341,9 +329,6 @@ pub fn step_llg_rk23_recompute_field_masked_relax_adaptive(
         scratch.k2[i] = llg_rhs_relax(scratch.m2.data[i], scratch.b2.data[i], gamma, alpha);
     }
 
-    // -----------------------
-    // Stage 3: m3 = m + dt*(3/4)*k2
-    // -----------------------
     for i in 0..n {
         let v = add_scaled(m.data[i], dt0 * A32, scratch.k2[i]);
         scratch.m3.data[i] = normalize(v);
@@ -364,7 +349,6 @@ pub fn step_llg_rk23_recompute_field_masked_relax_adaptive(
         scratch.m4.data[i] = normalize(v);
     }
 
-    // Stage 4 derivative at the 3rd-order solution
     build_h_eff_masked(grid, &scratch.m4, &mut scratch.b4, params, material, mask);
     for i in 0..n {
         scratch.k4[i] = llg_rhs_relax(scratch.m4.data[i], scratch.b4.data[i], gamma, alpha);
@@ -499,13 +483,11 @@ pub fn step_llg_rk4_recompute_field_masked(
     let dt = params.dt;
     let n = m.data.len();
 
-    // Stage 1
     build_h_eff_masked(grid, m, &mut scratch.b1, params, material, mask);
     for i in 0..n {
         scratch.k1[i] = llg_rhs(m.data[i], scratch.b1.data[i], gamma, alpha);
     }
 
-    // Stage 2
     for i in 0..n {
         let m1 = add_scaled(m.data[i], 0.5 * dt, scratch.k1[i]);
         scratch.m1.data[i] = normalize(m1);
@@ -515,7 +497,6 @@ pub fn step_llg_rk4_recompute_field_masked(
         scratch.k2[i] = llg_rhs(scratch.m1.data[i], scratch.b2.data[i], gamma, alpha);
     }
 
-    // Stage 3
     for i in 0..n {
         let m2 = add_scaled(m.data[i], 0.5 * dt, scratch.k2[i]);
         scratch.m2.data[i] = normalize(m2);
@@ -525,7 +506,6 @@ pub fn step_llg_rk4_recompute_field_masked(
         scratch.k3[i] = llg_rhs(scratch.m2.data[i], scratch.b3.data[i], gamma, alpha);
     }
 
-    // Stage 4
     for i in 0..n {
         let m3 = add_scaled(m.data[i], dt, scratch.k3[i]);
         scratch.m3.data[i] = normalize(m3);
@@ -535,7 +515,6 @@ pub fn step_llg_rk4_recompute_field_masked(
         scratch.k4[i] = llg_rhs(scratch.m3.data[i], scratch.b4.data[i], gamma, alpha);
     }
 
-    // Combine
     for i in 0..n {
         let incr = combo_rk4(scratch.k1[i], scratch.k2[i], scratch.k3[i], scratch.k4[i]);
         let m_new = add_scaled(m.data[i], dt, incr);
@@ -544,8 +523,6 @@ pub fn step_llg_rk4_recompute_field_masked(
 }
 
 /// Fixed-step RK4 recompute-field with an additional frozen external field addend `b_add` (Tesla).
-///
-/// Intended for Phase-2 bridge-mode demag integration.
 pub fn step_llg_rk4_recompute_field_masked_add(
     m: &mut VectorField2D,
     params: &LLGParams,
@@ -560,14 +537,12 @@ pub fn step_llg_rk4_recompute_field_masked_add(
     let dt = params.dt;
     let n = m.data.len();
 
-    // Stage 1
     build_h_eff_masked(grid, m, &mut scratch.b1, params, material, mask);
     add_field_inplace(&mut scratch.b1, b_add);
     for i in 0..n {
         scratch.k1[i] = llg_rhs(m.data[i], scratch.b1.data[i], gamma, alpha);
     }
 
-    // Stage 2
     for i in 0..n {
         let m1 = add_scaled(m.data[i], 0.5 * dt, scratch.k1[i]);
         scratch.m1.data[i] = normalize(m1);
@@ -578,7 +553,6 @@ pub fn step_llg_rk4_recompute_field_masked_add(
         scratch.k2[i] = llg_rhs(scratch.m1.data[i], scratch.b2.data[i], gamma, alpha);
     }
 
-    // Stage 3
     for i in 0..n {
         let m2 = add_scaled(m.data[i], 0.5 * dt, scratch.k2[i]);
         scratch.m2.data[i] = normalize(m2);
@@ -589,7 +563,6 @@ pub fn step_llg_rk4_recompute_field_masked_add(
         scratch.k3[i] = llg_rhs(scratch.m2.data[i], scratch.b3.data[i], gamma, alpha);
     }
 
-    // Stage 4
     for i in 0..n {
         let m3 = add_scaled(m.data[i], dt, scratch.k3[i]);
         scratch.m3.data[i] = normalize(m3);
@@ -600,7 +573,6 @@ pub fn step_llg_rk4_recompute_field_masked_add(
         scratch.k4[i] = llg_rhs(scratch.m3.data[i], scratch.b4.data[i], gamma, alpha);
     }
 
-    // Combine
     for i in 0..n {
         let incr = combo_rk4(scratch.k1[i], scratch.k2[i], scratch.k3[i], scratch.k4[i]);
         let m_new = add_scaled(m.data[i], dt, incr);
@@ -627,13 +599,11 @@ pub fn step_llg_rk4_recompute_field_masked_geom(
     let dt = params.dt;
     let n = m.data.len();
 
-    // Stage 1
     build_h_eff_masked_geom(grid, m, &mut scratch.b1, params, material, mask, geom_mask);
     for i in 0..n {
         scratch.k1[i] = llg_rhs(m.data[i], scratch.b1.data[i], gamma, alpha);
     }
 
-    // Stage 2
     for i in 0..n {
         let m1 = add_scaled(m.data[i], 0.5 * dt, scratch.k1[i]);
         scratch.m1.data[i] = normalize(m1);
@@ -651,7 +621,6 @@ pub fn step_llg_rk4_recompute_field_masked_geom(
         scratch.k2[i] = llg_rhs(scratch.m1.data[i], scratch.b2.data[i], gamma, alpha);
     }
 
-    // Stage 3
     for i in 0..n {
         let m2 = add_scaled(m.data[i], 0.5 * dt, scratch.k2[i]);
         scratch.m2.data[i] = normalize(m2);
@@ -669,7 +638,6 @@ pub fn step_llg_rk4_recompute_field_masked_geom(
         scratch.k3[i] = llg_rhs(scratch.m2.data[i], scratch.b3.data[i], gamma, alpha);
     }
 
-    // Stage 4
     for i in 0..n {
         let m3 = add_scaled(m.data[i], dt, scratch.k3[i]);
         scratch.m3.data[i] = normalize(m3);
@@ -687,7 +655,6 @@ pub fn step_llg_rk4_recompute_field_masked_geom(
         scratch.k4[i] = llg_rhs(scratch.m3.data[i], scratch.b4.data[i], gamma, alpha);
     }
 
-    // Combine
     for i in 0..n {
         let incr = combo_rk4(scratch.k1[i], scratch.k2[i], scratch.k3[i], scratch.k4[i]);
         let m_new = add_scaled(m.data[i], dt, incr);
@@ -696,8 +663,6 @@ pub fn step_llg_rk4_recompute_field_masked_geom(
 }
 
 /// Geometry-masked RK4 recompute-field with an additional frozen external field addend `b_add` (Tesla).
-///
-/// Intended for Phase-2 bridge-mode demag integration.
 pub fn step_llg_rk4_recompute_field_masked_geom_add(
     m: &mut VectorField2D,
     params: &LLGParams,
@@ -713,14 +678,12 @@ pub fn step_llg_rk4_recompute_field_masked_geom_add(
     let dt = params.dt;
     let n = m.data.len();
 
-    // Stage 1
     build_h_eff_masked_geom(grid, m, &mut scratch.b1, params, material, mask, geom_mask);
     add_field_inplace(&mut scratch.b1, b_add);
     for i in 0..n {
         scratch.k1[i] = llg_rhs(m.data[i], scratch.b1.data[i], gamma, alpha);
     }
 
-    // Stage 2
     for i in 0..n {
         let m1 = add_scaled(m.data[i], 0.5 * dt, scratch.k1[i]);
         scratch.m1.data[i] = normalize(m1);
@@ -739,7 +702,6 @@ pub fn step_llg_rk4_recompute_field_masked_geom_add(
         scratch.k2[i] = llg_rhs(scratch.m1.data[i], scratch.b2.data[i], gamma, alpha);
     }
 
-    // Stage 3
     for i in 0..n {
         let m2 = add_scaled(m.data[i], 0.5 * dt, scratch.k2[i]);
         scratch.m2.data[i] = normalize(m2);
@@ -758,7 +720,6 @@ pub fn step_llg_rk4_recompute_field_masked_geom_add(
         scratch.k3[i] = llg_rhs(scratch.m2.data[i], scratch.b3.data[i], gamma, alpha);
     }
 
-    // Stage 4
     for i in 0..n {
         let m3 = add_scaled(m.data[i], dt, scratch.k3[i]);
         scratch.m3.data[i] = normalize(m3);
@@ -777,7 +738,6 @@ pub fn step_llg_rk4_recompute_field_masked_geom_add(
         scratch.k4[i] = llg_rhs(scratch.m3.data[i], scratch.b4.data[i], gamma, alpha);
     }
 
-    // Combine
     for i in 0..n {
         let incr = combo_rk4(scratch.k1[i], scratch.k2[i], scratch.k3[i], scratch.k4[i]);
         let m_new = add_scaled(m.data[i], dt, incr);
@@ -787,7 +747,7 @@ pub fn step_llg_rk4_recompute_field_masked_geom_add(
 
 /// Adaptive Dormand–Prince RK45 (5(4)) with recompute-field at each substage.
 ///
-/// MuMax-like controller:
+/// Controller:
 /// - eps = dt * max |tau_high - tau_low|
 /// - dt_next = dt * headroom * (max_err/eps)^(1/5), clamped to [dt_min, dt_max]
 ///
@@ -845,18 +805,11 @@ pub fn step_llg_rk45_recompute_field_masked_adaptive(
     const BH6: f64 = 187.0 / 2100.0;
     const BH7: f64 = 1.0 / 40.0;
 
-    // -----------------------
-    // Stage 1: k1 at m (FSAL-aware)
-    // -----------------------
-    // Dormand–Prince RK45 is FSAL: if the previous step was accepted, k7/b7 were evaluated
-    // at the accepted end state and can be reused as the next step's k1/b1, provided
-    // nothing affecting B_eff changed.
     let fsal_ok = scratch.last_fsal_valid
         && scratch.last_mask == Some(mask)
         && scratch.last_b_ext == Some(params.b_ext);
 
     if fsal_ok {
-        // Reuse last accepted stage-7 field/torque as current stage-1.
         scratch.b1.data.clone_from(&scratch.b7.data);
         scratch.k1.clone_from(&scratch.k7);
     } else {
@@ -866,7 +819,6 @@ pub fn step_llg_rk45_recompute_field_masked_adaptive(
         }
     }
 
-    // Stage 2: m2 = m + dt*a21*k1
     for i in 0..n {
         let v = add_scaled(m.data[i], dt0 * A21, scratch.k1[i]);
         scratch.m2.data[i] = normalize(v);
@@ -876,7 +828,6 @@ pub fn step_llg_rk45_recompute_field_masked_adaptive(
         scratch.k2[i] = llg_rhs(scratch.m2.data[i], scratch.b2.data[i], gamma, alpha);
     }
 
-    // Stage 3
     for i in 0..n {
         let mut v = m.data[i];
         v = add_scaled(v, dt0 * A31, scratch.k1[i]);
@@ -888,7 +839,6 @@ pub fn step_llg_rk45_recompute_field_masked_adaptive(
         scratch.k3[i] = llg_rhs(scratch.m3.data[i], scratch.b3.data[i], gamma, alpha);
     }
 
-    // Stage 4
     for i in 0..n {
         let mut v = m.data[i];
         v = add_scaled(v, dt0 * A41, scratch.k1[i]);
@@ -901,7 +851,6 @@ pub fn step_llg_rk45_recompute_field_masked_adaptive(
         scratch.k4[i] = llg_rhs(scratch.m4.data[i], scratch.b4.data[i], gamma, alpha);
     }
 
-    // Stage 5
     for i in 0..n {
         let mut v = m.data[i];
         v = add_scaled(v, dt0 * A51, scratch.k1[i]);
@@ -915,7 +864,6 @@ pub fn step_llg_rk45_recompute_field_masked_adaptive(
         scratch.k5[i] = llg_rhs(scratch.m5.data[i], scratch.b5.data[i], gamma, alpha);
     }
 
-    // Stage 6
     for i in 0..n {
         let mut v = m.data[i];
         v = add_scaled(v, dt0 * A61, scratch.k1[i]);
@@ -930,7 +878,6 @@ pub fn step_llg_rk45_recompute_field_masked_adaptive(
         scratch.k6[i] = llg_rhs(scratch.m6.data[i], scratch.b6.data[i], gamma, alpha);
     }
 
-    // Stage 7 state (5th order solution)
     for i in 0..n {
         let mut v = m.data[i];
         v = add_scaled(v, dt0 * B1, scratch.k1[i]);
@@ -996,7 +943,6 @@ pub fn step_llg_rk45_recompute_field_masked_adaptive(
 
     let eps = err_inf * dt0;
 
-    // Next dt (MuMax-like)
     let mut dt_next = if eps > 0.0 {
         dt0 * headroom * (max_err / eps).powf(0.2)
     } else {
@@ -1009,14 +955,12 @@ pub fn step_llg_rk45_recompute_field_masked_adaptive(
 
     if accept {
         m.data.clone_from(&scratch.m7.data);
-        // Mark FSAL cache valid for next step.
         scratch.last_fsal_valid = true;
         scratch.last_mask = Some(mask);
         scratch.last_b_ext = Some(params.b_ext);
         params.dt = dt_next;
         (eps, true, dt0)
     } else {
-        // Reject: do not reuse trial-stage b7/k7.
         scratch.last_fsal_valid = false;
         scratch.last_mask = None;
         scratch.last_b_ext = None;
@@ -1063,13 +1007,11 @@ pub fn step_llg_rk4_recompute_field_masked_relax(
     let dt = params.dt;
     let n = m.data.len();
 
-    // Stage 1
     build_h_eff_masked(grid, m, &mut scratch.b1, params, material, mask);
     for i in 0..n {
         scratch.k1[i] = llg_rhs_relax(m.data[i], scratch.b1.data[i], gamma, alpha);
     }
 
-    // Stage 2
     for i in 0..n {
         let m1 = add_scaled(m.data[i], 0.5 * dt, scratch.k1[i]);
         scratch.m1.data[i] = normalize(m1);
@@ -1079,7 +1021,6 @@ pub fn step_llg_rk4_recompute_field_masked_relax(
         scratch.k2[i] = llg_rhs_relax(scratch.m1.data[i], scratch.b2.data[i], gamma, alpha);
     }
 
-    // Stage 3
     for i in 0..n {
         let m2 = add_scaled(m.data[i], 0.5 * dt, scratch.k2[i]);
         scratch.m2.data[i] = normalize(m2);
@@ -1089,7 +1030,6 @@ pub fn step_llg_rk4_recompute_field_masked_relax(
         scratch.k3[i] = llg_rhs_relax(scratch.m2.data[i], scratch.b3.data[i], gamma, alpha);
     }
 
-    // Stage 4
     for i in 0..n {
         let m3 = add_scaled(m.data[i], dt, scratch.k3[i]);
         scratch.m3.data[i] = normalize(m3);
@@ -1099,7 +1039,6 @@ pub fn step_llg_rk4_recompute_field_masked_relax(
         scratch.k4[i] = llg_rhs_relax(scratch.m3.data[i], scratch.b4.data[i], gamma, alpha);
     }
 
-    // Combine
     for i in 0..n {
         let incr = combo_rk4(scratch.k1[i], scratch.k2[i], scratch.k3[i], scratch.k4[i]);
         let m_new = add_scaled(m.data[i], dt, incr);
@@ -1109,7 +1048,7 @@ pub fn step_llg_rk4_recompute_field_masked_relax(
 
 /// Relax-mode RK4 recompute-field with an additional frozen external field addend `b_add` (Tesla).
 ///
-/// Intended for Phase-2 bridge-mode demag integration.
+/// Intended for bridge-mode demag integration.
 pub fn step_llg_rk4_recompute_field_masked_relax_add(
     m: &mut VectorField2D,
     params: &LLGParams,
@@ -1124,14 +1063,12 @@ pub fn step_llg_rk4_recompute_field_masked_relax_add(
     let dt = params.dt;
     let n = m.data.len();
 
-    // Stage 1
     build_h_eff_masked(grid, m, &mut scratch.b1, params, material, mask);
     add_field_inplace(&mut scratch.b1, b_add);
     for i in 0..n {
         scratch.k1[i] = llg_rhs_relax(m.data[i], scratch.b1.data[i], gamma, alpha);
     }
 
-    // Stage 2
     for i in 0..n {
         let m1 = add_scaled(m.data[i], 0.5 * dt, scratch.k1[i]);
         scratch.m1.data[i] = normalize(m1);
@@ -1142,7 +1079,6 @@ pub fn step_llg_rk4_recompute_field_masked_relax_add(
         scratch.k2[i] = llg_rhs_relax(scratch.m1.data[i], scratch.b2.data[i], gamma, alpha);
     }
 
-    // Stage 3
     for i in 0..n {
         let m2 = add_scaled(m.data[i], 0.5 * dt, scratch.k2[i]);
         scratch.m2.data[i] = normalize(m2);
@@ -1153,7 +1089,6 @@ pub fn step_llg_rk4_recompute_field_masked_relax_add(
         scratch.k3[i] = llg_rhs_relax(scratch.m2.data[i], scratch.b3.data[i], gamma, alpha);
     }
 
-    // Stage 4
     for i in 0..n {
         let m3 = add_scaled(m.data[i], dt, scratch.k3[i]);
         scratch.m3.data[i] = normalize(m3);
@@ -1164,7 +1099,6 @@ pub fn step_llg_rk4_recompute_field_masked_relax_add(
         scratch.k4[i] = llg_rhs_relax(scratch.m3.data[i], scratch.b4.data[i], gamma, alpha);
     }
 
-    // Combine
     for i in 0..n {
         let incr = combo_rk4(scratch.k1[i], scratch.k2[i], scratch.k3[i], scratch.k4[i]);
         let m_new = add_scaled(m.data[i], dt, incr);
@@ -1187,13 +1121,11 @@ pub fn step_llg_rk4_recompute_field_masked_relax_geom(
     let dt = params.dt;
     let n = m.data.len();
 
-    // Stage 1
     build_h_eff_masked_geom(grid, m, &mut scratch.b1, params, material, mask, geom_mask);
     for i in 0..n {
         scratch.k1[i] = llg_rhs_relax(m.data[i], scratch.b1.data[i], gamma, alpha);
     }
 
-    // Stage 2
     for i in 0..n {
         let m1 = add_scaled(m.data[i], 0.5 * dt, scratch.k1[i]);
         scratch.m1.data[i] = normalize(m1);
@@ -1211,7 +1143,6 @@ pub fn step_llg_rk4_recompute_field_masked_relax_geom(
         scratch.k2[i] = llg_rhs_relax(scratch.m1.data[i], scratch.b2.data[i], gamma, alpha);
     }
 
-    // Stage 3
     for i in 0..n {
         let m2 = add_scaled(m.data[i], 0.5 * dt, scratch.k2[i]);
         scratch.m2.data[i] = normalize(m2);
@@ -1229,7 +1160,6 @@ pub fn step_llg_rk4_recompute_field_masked_relax_geom(
         scratch.k3[i] = llg_rhs_relax(scratch.m2.data[i], scratch.b3.data[i], gamma, alpha);
     }
 
-    // Stage 4
     for i in 0..n {
         let m3 = add_scaled(m.data[i], dt, scratch.k3[i]);
         scratch.m3.data[i] = normalize(m3);
@@ -1247,7 +1177,6 @@ pub fn step_llg_rk4_recompute_field_masked_relax_geom(
         scratch.k4[i] = llg_rhs_relax(scratch.m3.data[i], scratch.b4.data[i], gamma, alpha);
     }
 
-    // Combine
     for i in 0..n {
         let incr = combo_rk4(scratch.k1[i], scratch.k2[i], scratch.k3[i], scratch.k4[i]);
         let m_new = add_scaled(m.data[i], dt, incr);
@@ -1256,8 +1185,6 @@ pub fn step_llg_rk4_recompute_field_masked_relax_geom(
 }
 
 /// Geometry-masked relax-mode RK4 recompute-field with an additional frozen external field addend `b_add` (Tesla).
-///
-/// Intended for Phase-2 bridge-mode demag integration.
 pub fn step_llg_rk4_recompute_field_masked_relax_geom_add(
     m: &mut VectorField2D,
     params: &LLGParams,
@@ -1273,14 +1200,12 @@ pub fn step_llg_rk4_recompute_field_masked_relax_geom_add(
     let dt = params.dt;
     let n = m.data.len();
 
-    // Stage 1
     build_h_eff_masked_geom(grid, m, &mut scratch.b1, params, material, mask, geom_mask);
     add_field_inplace(&mut scratch.b1, b_add);
     for i in 0..n {
         scratch.k1[i] = llg_rhs_relax(m.data[i], scratch.b1.data[i], gamma, alpha);
     }
 
-    // Stage 2
     for i in 0..n {
         let m1 = add_scaled(m.data[i], 0.5 * dt, scratch.k1[i]);
         scratch.m1.data[i] = normalize(m1);
@@ -1299,7 +1224,6 @@ pub fn step_llg_rk4_recompute_field_masked_relax_geom_add(
         scratch.k2[i] = llg_rhs_relax(scratch.m1.data[i], scratch.b2.data[i], gamma, alpha);
     }
 
-    // Stage 3
     for i in 0..n {
         let m2 = add_scaled(m.data[i], 0.5 * dt, scratch.k2[i]);
         scratch.m2.data[i] = normalize(m2);
@@ -1318,7 +1242,6 @@ pub fn step_llg_rk4_recompute_field_masked_relax_geom_add(
         scratch.k3[i] = llg_rhs_relax(scratch.m2.data[i], scratch.b3.data[i], gamma, alpha);
     }
 
-    // Stage 4
     for i in 0..n {
         let m3 = add_scaled(m.data[i], dt, scratch.k3[i]);
         scratch.m3.data[i] = normalize(m3);
@@ -1337,7 +1260,6 @@ pub fn step_llg_rk4_recompute_field_masked_relax_geom_add(
         scratch.k4[i] = llg_rhs_relax(scratch.m3.data[i], scratch.b4.data[i], gamma, alpha);
     }
 
-    // Combine
     for i in 0..n {
         let incr = combo_rk4(scratch.k1[i], scratch.k2[i], scratch.k3[i], scratch.k4[i]);
         let m_new = add_scaled(m.data[i], dt, incr);
@@ -1363,11 +1285,9 @@ pub fn step_llg_rk4_recompute_field_masked_relax_adaptive(
     m_big.data.clone_from(&m.data);
     m_small.data.clone_from(&m.data);
 
-    // big step
     params.dt = dt0;
     step_llg_rk4_recompute_field_masked_relax(&mut m_big, params, material, scratch, mask);
 
-    // two half steps
     params.dt = 0.5 * dt0;
     step_llg_rk4_recompute_field_masked_relax(&mut m_small, params, material, scratch, mask);
     step_llg_rk4_recompute_field_masked_relax(&mut m_small, params, material, scratch, mask);
@@ -1423,13 +1343,11 @@ pub fn step_llg_rk4_recompute_field_masked_relax_adaptive_geom(
     m_big.data.clone_from(&m.data);
     m_small.data.clone_from(&m.data);
 
-    // big step
     params.dt = dt0;
     step_llg_rk4_recompute_field_masked_relax_geom(
         &mut m_big, params, material, scratch, mask, geom_mask,
     );
 
-    // two half steps
     params.dt = 0.5 * dt0;
     step_llg_rk4_recompute_field_masked_relax_geom(
         &mut m_small,

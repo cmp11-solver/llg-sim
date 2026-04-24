@@ -1,54 +1,28 @@
 // src/effective_field/coarse_fft_demag.rs
 //
-// Coarse-FFT AMR demag: exact Newell-tensor FFT on the L0 grid with
-// M-restriction from patches, then bilinear interpolation to patches.
+// Coarse-FFT AMR demag: exact Newell-tensor FFT on the L0 grid with M
+// restricted from patches, then bilinear interpolation back to patches.
 //
-// This replaces the composite-grid Poisson approach (mg_composite.rs) with a
-// fundamentally simpler and more accurate strategy:
-//
-//   1. Restrict fine M from all patches onto the coarse (L0) grid via
-//      area-weighted averaging (UN-normalised, preserving charge structure).
-//   2. Run the existing `demag_fft_uniform` FFT convolution on the L0 grid.
-//      This uses the exact 3D Newell tensor — no Poisson reformulation, no
-//      boundary integral, no MG iterations.
+// Pipeline:
+//   1. Restrict fine M from all patches onto the coarse (L0) grid by
+//      area-weighted averaging (un-normalised, preserving the charge
+//      distribution ∇·M).
+//   2. Run `demag_fft_uniform` on the L0 grid. This uses the exact 3D Newell
+//      tensor, so all finite-thickness physics is encoded in the kernel — no
+//      Poisson reformulation, no boundary integral, no MG iterations.
 //   3. Bilinear-sample the resulting coarse B_demag onto each patch cell.
 //
-// Key insight (from Architecture Direction document):
-//   Demag is a convolution (B = N * M), not a Poisson problem.  FFT evaluates
-//   the native convolution directly, encoding all finite-thickness physics in
-//   the precomputed Newell tensor kernel.  The Poisson reformulation discards
-//   the kernel structure and forces reconstruction of open-boundary physics
-//   through complex mechanisms.
+// Using M-restriction rather than ∇·M injection (García-Cervera style) is both
+// simpler and more accurate here: the Newell tensor already handles ∇·M
+// internally, so injecting M directly into the FFT source avoids computing
+// ∇·M across mixed coarse/fine grids.
 //
-// Why M-restriction rather than ∇·M injection (García-Cervera):
-//   The Newell tensor handles ∇·M internally.  Injecting M directly into the
-//   FFT source is both simpler and more accurate than computing ∇·M on mixed
-//   coarse/fine grids and injecting it into a Poisson RHS.
-//
-// Performance:
-//   For a 192×192 base grid with ~16% patch coverage:
-//     all_fft  : FFT on 1536×1536 (padded 3072²) ≈ 29s
-//     coarse_fft: FFT on 192×192  (padded 384²)  ≈ 0.3–0.5s + 0.1s interp
-//   Expected ~50× speedup over all_fft.
-//
-// Super-coarse FFT (LLG_DEMAG_COARSEN_RATIO > 1):
-//   When L0 itself is large (>512²), the FFT on L0 can become the bottleneck.
-//   Super-coarse FFT adds an intermediate restriction step:
-//     1. Restrict M from patches → L0 (unchanged)
-//     2. Restrict M from L0 → demag grid of size (L0/R)²  [NEW]
-//     3. Run Newell FFT on the smaller demag grid
-//     4. Interpolate B_demag from demag grid → L0              [NEW]
-//     5. Interpolate B_demag from L0 → patches (unchanged)
-//   The FFT cost drops by ~R² (R=2 → 4×, R=4 → 16×).
-//   Accuracy: R=2 gives ~1–2% RMSE, R=4 gives ~2–4% RMSE.
-//   Default R=1 (no coarsening) preserves the current code path exactly.
-//
-// Validation contract:
-//   - Zero patches: must reproduce demag_fft_uniform on L0 exactly (bit-identical).
-//   - Single patch: coarse-FFT B at L0 cells should differ <1% from all_fft.
-//   - Full AMR:     RMSE vs all_fft < 3%, patches at vortex core (not edges).
-//   - R=1: must be bit-identical to the non-super-coarse path.
-//   - R=2: RMSE vs R=1 reference < 5% on smooth vortex states.
+// Optional super-coarse mode (LLG_DEMAG_COARSEN_RATIO = R, R a power of 2):
+// when L0 itself is large (>512²) the L0 FFT can dominate the cost. Setting
+// R>1 inserts an intermediate restriction step: M is further restricted from
+// L0 to an (L0/R)² demag grid, the FFT runs there, and B_demag is interpolated
+// back to L0 before the patch-level interpolation. Cost drops by ~R²; R=1
+// (the default) preserves the original code path exactly.
 
 use crate::amr::hierarchy::AmrHierarchy2D;
 use crate::amr::interp::sample_bilinear;
@@ -71,8 +45,6 @@ fn coarse_fft_diag() -> bool {
     *ENABLED.get_or_init(|| std::env::var("LLG_DEMAG_COARSE_FFT_DIAG").is_ok())
 }
 
-/// Read the super-coarse FFT coarsening ratio from environment.
-///
 /// `LLG_DEMAG_COARSEN_RATIO=R` where R ∈ {1, 2, 4, 8, ...}.
 /// Default R=1 (no super-coarsening; identical to the original code path).
 ///

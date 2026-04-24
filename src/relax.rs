@@ -1,5 +1,5 @@
 // ===============================
-// src/relax.rs (FULL FILE)
+// src/relax.rs
 // ===============================
 //
 // MuMax-like relaxation controller:
@@ -97,7 +97,6 @@ pub struct RelaxSettings {
 
     pub max_accepted_steps: usize,
 
-    // Optional internal gate (kept for compatibility; equilibrate.rs disables these)
     pub final_torque_gate: Option<f64>,
     pub final_torque_gate_max: Option<f64>,
     pub gate_max_extra_accepted_steps: usize,
@@ -361,7 +360,6 @@ pub fn relax_with_report(
 
     let max_accepted_steps = settings.max_accepted_steps;
 
-    // Internal gate (usually disabled; equilibrate.rs turns it off explicitly).
     let gate_metric = settings.final_torque_gate;
     let gate_max = settings.final_torque_gate_max;
     let gate_extra_steps = settings.gate_max_extra_accepted_steps;

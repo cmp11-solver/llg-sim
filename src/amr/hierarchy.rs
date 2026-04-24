@@ -19,7 +19,7 @@ use crate::vector_field::VectorField2D;
 /// Notes:
 /// - This file provides the multi-level *data structure* (nested patch sets) and
 ///   level-aware IO/diagnostic flattening.
-/// - Time stepping / ghost fill between levels is handled in `stepper.rs`.
+/// - Level-1 patches are kept in `patches` for backward compatibility.
 /// - For now, level-1 patches are kept in `patches` for backward compatibility.
 ///   Additional levels live in `patches_l2plus`.
 pub struct AmrHierarchy2D {
@@ -1055,11 +1055,7 @@ fn is_ghost(i: usize, j: usize, g: usize, nx: usize, ny: usize) -> bool {
 /// by any rectangle in `deeper_rects` (expressed in base-grid coordinates).
 ///
 /// Each fine cell at patch-local coords (i_patch, j_patch) maps to a parent
-/// coarse cell at base-grid coords:
-///
-///     base_i = coarse_rect.i0 + (i_patch - ghost) / patch.ratio
-///     base_j = coarse_rect.j0 + (j_patch - ghost) / patch.ratio
-///
+/// coarse cell at base-grid coords.
 /// If that coarse cell falls inside any deeper-level patch rect, the cell
 /// is removed from `active` because the deeper level will compute it at
 /// higher resolution and restriction will overwrite the result.

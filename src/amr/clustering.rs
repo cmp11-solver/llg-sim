@@ -1,6 +1,6 @@
 // src/amr/clustering.rs
 //
-// Stage-2B: Multi-patch clustering for block-structured AMR.
+// Multi-patch clustering for block-structured AMR.
 //
 // Goal:
 // - Given a coarse-grid refinement indicator, identify *multiple disjoint* regions

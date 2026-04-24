@@ -2,9 +2,6 @@
 //
 // Interfacial (Néel-type) DMI for thin films (MuMax3).
 //
-// MuMax3 Eq. (10):
-//   B_DM = (2D/Msat) * ( ∂x m_z, ∂y m_z, -(∂x m_x + ∂y m_y) )
-//
 // Boundary conditions (Eq. 11–15) are imposed using ghost neighbours so derivatives remain central.
 // In case of nonzero D, these BCs must also be applied to exchange.
 //
@@ -21,7 +18,6 @@ fn ghost_x(m: [f64; 3], n_x: f64, eta: f64, dx: f64) -> [f64; 3] {
     let my = m[1];
     let mz = m[2];
 
-    // Eq. 11, 13, 14 (x-normal boundary)
     let dmx_dx = -eta * mz;
     let dmy_dx = 0.0;
     let dmz_dx = eta * mx;
@@ -39,7 +35,6 @@ fn ghost_y(m: [f64; 3], n_y: f64, eta: f64, dy: f64) -> [f64; 3] {
     let my = m[1];
     let mz = m[2];
 
-    // Eq. 12, 13, 14 (y-normal boundary)
     let dmx_dy = 0.0;
     let dmy_dy = -eta * mz;
     let dmz_dy = eta * my;
@@ -61,9 +56,7 @@ pub fn add_dmi_field(grid: &Grid2D, m: &VectorField2D, b_eff: &mut VectorField2D
 /// - Cells with `geom_mask[idx] == false` are treated as vacuum: they contribute no DMI field.
 /// - Neighbours outside the mask are treated as a free boundary into vacuum by using
 ///   `m_nb := m_center` (so the discrete derivative across vacuum is zero).
-///
-/// Domain-edge boundary conditions (MuMax3 Eq. 11–15) are still applied at the simulation
-/// domain boundary when the current cell is inside the mask.
+
 pub fn add_dmi_field_masked(
     grid: &Grid2D,
     m: &VectorField2D,

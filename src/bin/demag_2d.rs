@@ -15,7 +15,7 @@
 // Compare against MuMax output:
 //   mumax_outputs/demag2D/table.txt
 //
-// MuMax side should append 3 rows using TableSave() after each Run(0).   [oai_citation:0‡mumax.github.io](https://mumax.github.io/api.html?utm_source=chatgpt.com)
+// MuMax side should append 3 rows using TableSave() after each Run(0).
 
 use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};

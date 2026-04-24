@@ -1,3 +1,5 @@
+// src/amr/mod.rs
+
 pub mod hierarchy;
 pub mod interp;
 pub mod patch;

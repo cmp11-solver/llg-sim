@@ -1,8 +1,7 @@
 // src/effective_field/demag_poisson_mg.rs
 //
-// Experimental demag alternative:
-//   Solve magnetostatic scalar potential phi on a padded 3D box using geometric multigrid.
-//
+// Demag via geometric multigrid on a padded 3D box:
+// Solve the magnetostatic scalar potential phi, then derive B_demag.
 // Physics (SI):
 //   H = -∇phi
 //   ∇² phi = ∇·M     (with M = Ms*m in the magnet, M = 0 in vacuum)
@@ -38,7 +37,7 @@
 //   LLG_DEMAG_MG_HYBRID_DIAG=1                (prints ΔK sum-rule / tail diagnostics when (re)building ΔK)
 //   LLG_DEMAG_MG_HYBRID_DIAG_INVAR=1          (expensive location-invariance check during ΔK build; debug only)
 //
-// - **A3/A4 operator controls (finest-grid Laplacian + MG transfer/coarse operators):**
+// - **Operator controls (finest-grid Laplacian + MG transfer/coarse operators):**
 //   LLG_DEMAG_MG_STENCIL   = "7" | "iso9" | "iso27"     (default: "iso27")
 //   LLG_DEMAG_MG_PROLONG   = "inject" | "trilinear"     (default: "trilinear")
 //   LLG_DEMAG_MG_COARSE_OP = "rediscretize" | "galerkin" (default: "galerkin")
@@ -701,7 +700,7 @@ impl DeltaKernel2D {
 
 
 // -----------------------------------------------------------------------------
-// A3/A4 operator + multigrid hygiene upgrades (stencil/prolong/coarse-op)
+// Operator controls (finest-grid Laplacian + MG transfer/coarse operators)
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

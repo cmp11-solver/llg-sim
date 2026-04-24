@@ -1,15 +1,13 @@
-/*
-  demagSmall comparison script for Rust (Nz=1).
-
-  Geometry matches MuMax test/demagSmall.mx3:
-    Grid: 3 x 4 x 1
-    Cell: 1e-9, 2e-9, 0.5e-9
-
-  Msat = 1/mu0 so B_demag.Average() returns dimensionless demag tensor entries.
-  DemagAccuracy = 10 to match Rust DEMAG_ACCURACY=10.
-
-  We use TableSave() to append a single row after each Run(0) evaluation.  (MuMax API)
-*/
+// mumax/demagSmall.mx3
+//
+// Small-grid demag comparison for Rust (Nz=1).
+// Geometry matches MuMax test/demagSmall.mx3: 3 x 4 x 1 grid, cell 1e-9 x 2e-9 x 0.5e-9 m.
+// Msat = 1/mu0 so B_demag.Average() returns dimensionless demag tensor entries.
+// DemagAccuracy = 10 to match Rust DEMAG_ACCURACY=10.
+// TableSave() appends one row after each Run(0) evaluation.
+//
+// Run:
+//   mumax3 mumax/demagSmall.mx3
 
 SetGridSize(3, 4, 1)
 SetCellSize(1e-9, 2e-9, 0.5e-9)

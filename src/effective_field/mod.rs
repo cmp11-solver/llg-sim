@@ -1,6 +1,9 @@
 // src/effective_field/mod.rs
-/// NOTE: Despite the name build_h_eff*, this builds the effective induction B_eff (Tesla),
-/// consistent with the global convention used throughout the solver.
+//
+// Effective-field term modules. Despite the name `build_h_eff*`, the builders
+// below return the effective induction B_eff (Tesla), consistent with the
+// convention used throughout the solver.
+
 pub mod anisotropy;
 pub mod demag;
 pub mod demag_fft_uniform;
@@ -9,26 +12,18 @@ pub mod dmi;
 pub mod exchange;
 pub mod zeeman;
 
-// 3D multigrid infrastructure (restored from pre-FK codebase)
+// 3D multigrid infrastructure.
 pub mod mg_kernels;
 pub mod mg_treecode;
 
-// Diagnostics (timing infrastructure)
+// Timing and diagnostic infrastructure for the multigrid solver.
 pub mod mg_diagnostics;
 
-// AMR composite-grid wrapper (calls 3D MG solver on coarse grid)
+// AMR composite-grid wrapper: 3D MG on the coarse grid plus a patch-level correction.
 pub mod mg_composite;
 
-// AMR coarse-FFT wrapper (production — exact Newell-tensor FFT on L0)
+// AMR coarse-FFT wrapper: Newell-tensor FFT on L0 with patch M-restriction.
 pub mod coarse_fft_demag;
-
-// Retired / archived modules (2D FK decomposition — broken, see project docs):
-//   boundary_integral_2d.rs  — 2D single-layer potential (sign/node-cell bugs)
-//   mg_stencil.rs            — 2D Laplacian stencils (FK-specific)
-//   mg_solver.rs             — 2D cell-centred MG (FK-specific)
-//   mg_config.rs             — 2D MG config (superseded by config in demag_poisson_mg.rs)
-//   demag_poisson_dst.rs     — DST-based Poisson solver (retired; kernel mismatch)
-//   dst_poisson_2d.rs        — DST spectral solver (retired)
 
 use crate::grid::Grid2D;
 use crate::params::{LLGParams, Material};

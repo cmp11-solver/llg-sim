@@ -1,3 +1,15 @@
+// mumax/st_problems/sp4a.mx3
+//
+// µMAG Standard Problem #4, field sequence "a" (-24.6, +4.3, 0) mT.
+// Relaxes an s-state on a 500 x 125 x 3 nm Permalloy strip, then switches
+// under the SP4a field for 1 ns, saving OVF snapshots every 100 ps plus
+// an extra snapshot at the <mx>=0 crossover for direct comparison with
+// the Rust solver's intermediate state.
+// Matches src/bin/st_problems/sp4.rs (run with argument "a").
+//
+// Run:
+//   mumax3 mumax/st_problems/sp4a.mx3
+
 Nx := 200
 Ny := 50
 SetGridSize(Nx, Ny, 1)

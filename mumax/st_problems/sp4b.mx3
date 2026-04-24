@@ -1,3 +1,13 @@
+// mumax/st_problems/sp4b.mx3
+//
+// µMAG Standard Problem #4, field sequence "b" (-35.5, -6.3, 0) mT.
+// Same geometry and relaxed s-state as sp4a; switches under the stronger
+// SP4b field for 1 ns, saving OVF snapshots every 100 ps.
+// Matches src/bin/st_problems/sp4.rs (run with argument "b").
+//
+// Run:
+//   mumax3 mumax/st_problems/sp4b.mx3
+
 Nx := 200
 Ny := 50
 SetGridSize(Nx, Ny, 1)

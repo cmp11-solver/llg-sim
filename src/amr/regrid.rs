@@ -1,14 +1,14 @@
 // src/amr/regrid.rs
 //
-// Regridding logic (Stage 2A + Stage 2B).
+// Regridding logic in two variants:
 //
-// Stage 2A:
-// - Single dynamic patch built from a coarse-grid indicator bbox.
+// Single-patch:
+// - Dynamic patch built from a coarse-grid indicator bbox.
 // - Regrid periodically, but only apply if the patch changed "materially".
 //
-// Stage 2B:
-// - Multi-patch dynamic regrid using clustering (clustering.rs).
-// - Apply a cheap hysteresis check to avoid 1-cell jitter: compare union-bbox
+// Multi-patch:
+// - Dynamic regrid using clustering (clustering.rs).
+// - Cheap hysteresis check to avoid 1-cell jitter: compare union-bbox
 //   movement/size change between old and new patch sets.
 
 use crate::amr::clustering::{
@@ -731,7 +731,7 @@ pub fn maybe_regrid_nested_levels(
     // is evaluated on the parent-level composite field (L0 coarse + parent
     // patches).  This is the standard AMReX approach.
     //
-    // The smoothed indicator max (Change E, Run 10d) stabilises the relative
+    // The smoothed indicator max stabilises the relative
     // threshold to prevent the 8↔21 clustering bifurcation without decoupling
     // the indicator from the parent composite.  This preserves the correct
     // frequency (~700 MHz) while eliminating patch count oscillation.

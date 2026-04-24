@@ -17,13 +17,12 @@ Aex  = 0
 Ku1  = 0
 
 // Disable magnetostatic interaction so physics matches the current Rust code.
-NoDemagSpins.Set(1)  // disable demag everywhere  [oai_citation:1‡GitHub](https://github.com/mumax/3/blob/master/engine/demag.go?utm_source=chatgpt.com)
-
+NoDemagSpins.Set(1)  // disable demag everywhere
 // LLG parameters
 alpha = 0.01
 
 B0 := 1.0
-B_ext = vector(0, 0, B0) // Tesla  [oai_citation:2‡mumax.github.io](https://mumax.github.io/api.html)
+B_ext = vector(0, 0, B0) // Tesla
 
 // Small tilt to excite precession
 theta := 5 * pi / 180
@@ -36,7 +35,7 @@ TableAdd(E_Zeeman)
 
 // Fixed timestep sampling to match Rust CSV spacing
 FixDt = 5e-14
-TableAutoSave(5e-14)  // write a row every dt  [oai_citation:3‡mumax.github.io](https://mumax.github.io/api.html)
+TableAutoSave(5e-14)  // write a row every dt
 
 // Run time
 Run(5e-9) // 5 ns

@@ -3,17 +3,6 @@
 // ===============================
 //
 // One-shot, state-based grid selection for SP2 (uniform grid; no true AMR).
-//
-// Goal:
-//  - Avoid hardcoding regime switches in terms of d/lex.
-//  - Decide whether to refine based on *state metrics* computed from the remanent state.
-//
-// This module provides:
-//  - `Sp2GridMode`: MuMax SP2-Appendix grid vs a generic target-cell/pow2 grid
-//  - `Sp2GridPolicy`: thresholds + refinement factor
-//  - `build_sp2_grid(...)`: build baseline grid for SP2 geometry
-//  - `remanence_metrics(...)`: cheap nonuniformity metrics
-//  - `maybe_refine_after_remanence(...)`: decide if one-shot refine is needed
 
 use crate::grid::Grid2D;
 use crate::relax::RelaxReport;
@@ -25,9 +14,7 @@ use crate::vector_field::VectorField2D;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sp2GridMode {
-    /// Generic "target cell" sizing: choose cell size ~ (cell_over_lex * lex), then round nx and ny independently to powers of two.
     Mumax,
-    /// MuMax SP2 Appendix-style sizing: enforce nx = 5*2^p, ny = nx/5, and dx = dy with cellsize ~ 0.5*lex.
     Legacy,
 }
 
@@ -50,25 +37,11 @@ impl Sp2GridMode {
 pub struct Sp2GridPolicy {
     /// Grid construction mode.
     pub mode: Sp2GridMode,
-
-    /// Baseline target cell size as a fraction of lex (MuMax references often use ~0.75).
     pub cell_over_lex: f64,
-
-    /// If refining, multiply cell_over_lex by this factor (<1 means finer).
-    /// Example: 0.5 halves the cell size.
     pub refine_factor: f64,
-
-    /// Maximum number of one-shot refinements (keep at 1 for now).
     pub max_refinements: usize,
-
-    /// Threshold on RMS nearest-neighbour angle (radians).
     pub nn_angle_rms_threshold: f64,
-
-    /// Threshold on max nearest-neighbour angle (radians).
     pub nn_angle_max_threshold: f64,
-
-    /// If the remanence relax took an unusually large number of accepted steps,
-    /// treat as a stiffness signal and allow refinement.
     pub remanence_steps_threshold: usize,
 }
 
@@ -275,10 +248,6 @@ pub fn maybe_refine_after_remanence(
 
     None
 }
-
-/// Convenience: resample remanence onto a refined grid.
-///
-/// This does *not* run Relax again; callers should re-equilibrate after resampling.
 pub fn resample_remanence_to_policy_grid(
     d_lex: usize,
     lex: f64,
@@ -291,10 +260,6 @@ pub fn resample_remanence_to_policy_grid(
 }
 
 /// Default SP2 grid policy.
-///
-/// The SP2 runner calls this as `default_sp2_grid_policy(lex)`.
-/// For now it returns `Sp2GridPolicy::default()`, but keeping it as a named helper
-/// lets us add env overrides later without touching the SP2 solver logic.
 pub fn default_sp2_grid_policy(_lex: f64) -> Sp2GridPolicy {
     Sp2GridPolicy::default()
 }

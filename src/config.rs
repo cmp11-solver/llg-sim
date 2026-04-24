@@ -1,3 +1,7 @@
+// src/config.rs
+//
+// JSON run-config metadata written alongside simulation outputs for provenance.
+
 use serde::Serialize;
 use serde_json;
 use std::fs::File;

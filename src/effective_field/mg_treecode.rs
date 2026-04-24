@@ -1,20 +1,13 @@
 // src/effective_field/mg_treecode.rs
 //
-// Change B: Barnes–Hut treecode for open-boundary Dirichlet values,
-// extracted from demag_poisson_mg.rs into a standalone module.
+// Barnes–Hut treecode for open-boundary Dirichlet values on a padded 3D box.
 //
-// This computes:
+// Computes
 //   phi(r) = -(1/4π) ∫ rhs(r') / |r - r'| dV'
+// on the six boundary faces using monopole + dipole moments per tree node.
 //
-// on the boundary faces of a padded 3D box using monopole + dipole moments.
-//
-// Standalone so that:
-//   1. The composite-grid solver can call it for L0 boundaries only.
-//   2. Future García-Cervera boundary integral (Change D) can be added
-//      alongside as an alternative BC method.
-//
-// NO NUMERICS CHANGE — the treecode evaluation must be bit-exact with the
-// original inline implementation.
+// Kept as a standalone module so the composite-grid solver can reuse it for
+// L0 boundaries independently of the full padded-box MG solver.
 
 use std::f64::consts::PI;
 

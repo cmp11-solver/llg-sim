@@ -40,8 +40,7 @@ fn ghost_y(m: [f64; 3], n_y: f64, eta: f64, dy: f64) -> [f64; 3] {
 /// - If `mask[idx] == false`, we add *no exchange field* at that cell.
 /// - If a neighbour is outside the mask, we treat it as a free boundary (Neumann):
 ///   use `m_nb := m_center` so the finite-difference gradient across vacuum is zero.
-/// - If interfacial DMI is enabled (MuMax-style), we apply the same chiral ghost
-///   construction at both the domain boundary and any mask boundary.
+
 pub fn add_exchange_field_masked(
     grid: &Grid2D,
     m: &VectorField2D,

@@ -72,7 +72,7 @@ def sort_by_d(d, *cols):
 
 
 def find_mumax_table_from_root(root: Path) -> Path:
-    # Preferred path used in your MuMax outputs:
+    # Preferred path used in the MuMax reference outputs:
     candidate = root / "sp2_out" / "table.txt"
     if candidate.exists():
         return candidate

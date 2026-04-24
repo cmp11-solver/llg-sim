@@ -21,9 +21,6 @@ use std::collections::VecDeque;
 pub struct MinimizeSettings {
     pub torque_threshold: f64, // Tesla
     pub max_iters: usize,
-
-    // Pseudo-step size for descent (dimensionless scale multiplying d).
-    // Good starting point ~ alpha*gamma*dt used in relax (order ~1e-2).
     pub lambda0: f64,
     pub lambda_min: f64,
     pub lambda_max: f64,

@@ -1,14 +1,11 @@
 // src/effective_field/mg_kernels.rs
 //
-// Change A: Free-function numerical kernels for the geometric multigrid Poisson solver.
+// Free-function numerical kernels for the geometric multigrid Poisson solver.
 //
-// Extracted from DemagPoissonMG so they operate on raw slices + explicit grid
-// dimensions. The existing MGLevel methods become thin wrappers (see
-// demag_poisson_mg.rs). This creates the seam for the composite-grid AMR solver
-// (CompositeGridPoissonMG) where each "level" is a collection of AMR patches,
-// not a single padded box.
-//
-// NO NUMERICS CHANGE — the uniform-grid path must remain bit-exact after refactor.
+// These operate on raw slices with explicit grid dimensions so the same
+// kernels can be reused by the uniform padded-box solver (demag_poisson_mg.rs)
+// and by the composite-grid AMR solver (mg_composite.rs), where each "level"
+// is a collection of AMR patches rather than a single padded box.
 
 use rayon::prelude::*;
 

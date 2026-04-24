@@ -113,7 +113,6 @@ pub fn compute_energy_geom(
     };
 
     // If demag enabled, compute B_demag on the whole grid once.
-    // NOTE: demag with masked geometries is handled separately (Stage 3).
     let mut b_demag = VectorField2D::new(*grid);
     if material.demag {
         b_demag.set_uniform(0.0, 0.0, 0.0);

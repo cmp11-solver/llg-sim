@@ -22,11 +22,11 @@ use crate::amr::interp::sample_bilinear;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AmrDemagMode {
-    /// Bridge-B style: flatten to uniform fine, run FFT demag on that, then sample back.
+    /// Flatten the hierarchy to a uniform fine grid, run FFT demag on that, then sample back.
     AllFft,
-    /// Stage 3A: run Poisson-MG demag only on the coarse grid; patches get no demag addend.
+    /// Run Poisson-MG demag only on the coarse grid; patches get no demag addend.
     MixMgCoarseOnly,
-    /// Stage 3B: run Poisson-MG demag on the flattened uniform-fine composite, then sample back.
+    /// Flatten to a uniform fine composite, run Poisson-MG demag on that, then sample back.
     AllMgUniformFine,
     /// AMR-aware composite-grid: enhanced-RHS MG on L0 + interpolation to patches.
     /// Avoids flattening to uniform fine — V-cycle runs on the coarse grid only.
@@ -185,7 +185,7 @@ fn assert_field_finite(_name: &str, _f: &VectorField2D) {}
 /// Ghost cells should *not* be updated by the integrator (they are boundary data
 /// coming from coarse→fine interpolation).
 ///
-/// NOTE: For Stage 1 we keep ghosts fixed over the whole RK step.
+/// NOTE: Ghosts are kept fixed over the whole RK step in this stepper.
 /// Later we can upgrade to refilling ghosts at each substage using a coarse predictor.
 pub fn step_patch_rk4_recompute_field_masked_active(
     m: &mut VectorField2D,
@@ -351,20 +351,18 @@ pub fn step_patch_rk4_recompute_field_masked_active(
 }
 
 // ------------------------------------------------------------
-// Hierarchy stepper (Stage 1): coarse + level-1 patches.
+// Hierarchy stepper: coarse grid + level-1 patches.
 // ------------------------------------------------------------
 
-/// A simple RK4 stepper for a 2-level AMR hierarchy.
+///  simple RK4 stepper for a 2-level AMR hierarchy.
 ///
-/// For now, we:
+/// The algorithm per RK step is:
 /// 1) fill fine ghosts from coarse
 /// 2) advance fine patches (active interior only)
 /// 3) advance coarse grid (whole domain)
 /// 4) restrict fine back to coarse under patches
 ///
-/// This is *not* yet a full Berger–Colella time integration scheme
-/// (no subcycling, no refluxing). It's the smallest working unit
-/// to validate AMR plumbing with local stencils.
+/// This is a lightweight stepper without subcycling or refluxing.
 pub struct AmrStepperRK4 {
     pub coarse_scratch: RK4Scratch,
 
@@ -593,7 +591,7 @@ impl AmrStepperRK4 {
         );
 
         if needs_fine_grid {
-            // Phase-2 Bridge B: build the flattened *uniform fine composite* magnetisation.
+            // Build the flattened *uniform fine composite* magnetisation.
             //
             // This composite is used both for FFT demag (gold operator) and as the source of
             // parent-consistent ghost values for nested patches.
@@ -838,7 +836,7 @@ impl AmrStepperRK4 {
                 }
             }
             AmrDemagMode::MixMgCoarseOnly => {
-                // Stage 3A: compute demag only on the coarse grid using Poisson-MG.
+                // Compute demag only on the coarse grid using Poisson-MG.
                 assert_field_finite("h.coarse before MG coarse demag", &h.coarse);
                 demag_poisson_mg::compute_demag_field_poisson_mg(
                     &h.base_grid,
@@ -858,7 +856,7 @@ impl AmrStepperRK4 {
                 assert_field_finite("b_demag_coarse (MG coarse)", &self.b_demag_coarse);
             }
             AmrDemagMode::AllMgUniformFine => {
-                // Stage 3B: compute demag on the flattened uniform-fine composite using Poisson-MG.
+                // Compute demag on the flattened uniform-fine composite using Poisson-MG.
                 if self.b_demag_fine.grid.nx != m_fine.grid.nx
                     || self.b_demag_fine.grid.ny != m_fine.grid.ny
                     || self.b_demag_fine.grid.dx != m_fine.grid.dx

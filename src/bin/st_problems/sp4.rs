@@ -1,7 +1,7 @@
 // src/bin/st_problems/sp4.rs
 //
 // Standard Problem 4 (a/b): Permalloy thin film reversal with demag.
-// Matches your MuMax scripts:
+// Matches the MuMax SP4 scripts in mumax/st_problems/:
 //
 // Nx=200 Ny=50 Nz=1
 // dx=500nm/Nx dy=125nm/Ny dz=3nm
@@ -138,7 +138,7 @@ fn write_sp4_ovf_snapshot(
 }
 
 pub fn run_sp4(case: char) -> std::io::Result<()> {
-    // --- match MuMax SP4 script (your working one) ---
+    // --- match MuMax SP4 script parameters ---
     let nx: usize = 200;
     let ny: usize = 50;
     let dx: f64 = 500e-9 / (nx as f64);
@@ -159,7 +159,7 @@ pub fn run_sp4(case: char) -> std::io::Result<()> {
     let t_total: f64 = 1e-9; // 1 ns
     let n_out: usize = (t_total / dt_out).round() as usize; // 100
 
-    // RK45 controller (same style as uniform_film_field_rk45.rs)
+    // RK45 controller
     let dt0_run: f64 = 1e-13;
     let max_err: f64 = 1e-5;
     let headroom: f64 = 0.8;

@@ -74,8 +74,6 @@ pub static TIMING: DemagTimingAccum = DemagTimingAccum::new();
 // ---------------------------------------------------------------------------
 // Convenience timer
 // ---------------------------------------------------------------------------
-
-/// RAII timer that accumulates elapsed nanoseconds into an AtomicU64.
 pub struct PhaseTimer<'a> {
     target: &'a AtomicU64,
     start: Instant,

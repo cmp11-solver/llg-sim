@@ -416,7 +416,7 @@ fn demag_energy_j(
 /// E_z  = -(1/2) integral (Mz*Bz) dV            (out-of-plane contribution)
 ///
 /// E_total = E_xy + E_z.  Splitting lets us see that E_z is exact (Kzz FFT)
-/// while E_xy carries the FK/MG approximation error.
+/// while E_xy carries the MG approximation error.
 fn demag_energy_j_split(
     grid: &Grid2D,
     m: &VectorField2D,
@@ -616,7 +616,7 @@ pub fn run(case: char) -> io::Result<()> {
         );
     }
     eprintln!(
-        "[sk1]   E_xy: fft={:.6e}  mg={:.6e}  dE_xy={:.3e} J  (FK/MG in-plane)",
+        "[sk1]   E_xy: fft={:.6e}  mg={:.6e}  dE_xy={:.3e} J  (MG in-plane)",
         e_fft_xy, e_mg_xy, e_mg_xy - e_fft_xy,
     );
     eprintln!(
